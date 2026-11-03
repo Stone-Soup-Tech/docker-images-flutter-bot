@@ -1,0 +1,24 @@
+definitions:
+  caches:
+    flutter-bot-pub: /opt/pub-cache
+pipelines:
+  custom:
+    flutter-dependency-updates:
+      - variables:
+          - name: DRY_RUN
+            default: 'true'
+            allowed-values: ['true', 'false']
+      - step:
+          name: Update Flutter dependencies
+          image: ghcr.io/stone-soup-tech/flutter-bot:latest
+          max-time: 30
+          clone:
+            enabled: false
+          concurrency-group: flutter-bot-pub
+          caches:
+            - flutter-bot-pub
+          script:
+            - export FLUTTER_BOT_DRY_RUN="$DRY_RUN"
+            - flutter-bot
+# No Docker service required. Add this step alongside Android/Renovate in a
+# parallel block. Add flutter-bot/* to the consumer's branch validation rules.

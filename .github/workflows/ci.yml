@@ -1,0 +1,40 @@
+name: Validate runner and image
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      flutter-image:
+        description: Flutter base image to validate
+        type: string
+        required: false
+        default: ghcr.io/stone-soup-tech/flutter:latest
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+      - name: Runner and release tests
+        run: python3 -B -m unittest discover -s test -p 'test_*.py'
+      - name: Build with selected Flutter base
+        env:
+          FLUTTER_IMAGE: ${{ inputs.flutter-image || 'ghcr.io/stone-soup-tech/flutter:latest' }}
+        run: docker build --pull --build-arg "FLUTTER_IMAGE=$FLUTTER_IMAGE" -f sdk/Dockerfile -t flutter-bot:test .
+      - name: Smoke test tools and real Pub resolution
+        run: |
+          docker run --rm flutter-bot:test bash -ec '
+            flutter --version
+            python3 --version
+            git --version
+            flutter-bot --help
+            mkdir -p /tmp/smoke
+            cd /tmp/smoke
+            printf "name: flutter_bot_smoke\nenvironment:\n  sdk: ^3.0.0\ndependencies:\n  collection: ^1.0.0\n" > pubspec.yaml
+            flutter pub upgrade --major-versions --no-precompile --no-example
+            flutter pub upgrade --tighten --no-precompile --no-example
+            test -s pubspec.lock
+            flutter pub outdated --json --no-prereleases --show-all
+          '
