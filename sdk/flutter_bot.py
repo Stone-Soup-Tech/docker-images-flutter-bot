@@ -261,6 +261,21 @@ def pub(checkout, environment, *arguments, capture=False):
     return result.stdout if capture else None
 
 
+def lockfile_versions(content):
+    """Read package versions from Pub's generated lockfile format."""
+    if content is None:
+        return {}
+    versions = {}
+    package = None
+    for line in content.decode().splitlines():
+        match = re.fullmatch(r"  ([A-Za-z0-9_]+):", line)
+        if match:
+            package = match[1]
+        elif package and line.startswith("    version: "):
+            versions[package] = line.split(": ", 1)[1].strip("\"'")
+    return versions
+
+
 def run_updates(checkout, client, base_sha):
     """Resolve dependencies directly in the pipeline's disposable checkout."""
     environment = git_environment(client)
@@ -292,23 +307,28 @@ def run_updates(checkout, client, base_sha):
     updated = [path.read_bytes() for path in paths]
     if original == updated:
         return None
+    previous_versions = lockfile_versions(original[1])
     rows = []
+    held_back = []
     dependencies = []
     for package in packages:
         current = (package.get("current") or {}).get("version")
-        latest = (package.get("latest") or {}).get("version")
         if current:
             dependencies.append({"name": package["package"], "version": current})
+        latest = (package.get("latest") or {}).get("version")
         if current and latest and current != latest:
-            rows.append(f"| {package['package']} | {current} | {latest} |")
+            held_back.append(f"| {package['package']} | {current} | {latest} |")
+        previous = previous_versions.get(package["package"])
+        if package.get("kind") in ("direct", "dev") and current and current != previous:
+            rows.append(f"| {package['package']} | {previous or 'Not locked'} | {current} |")
     body = "Updates direct dependency constraints to the newest mutually compatible stable versions and refreshes the lockfile."
     body += "\n\nFlutter SDK pins and package compatibility constraints remain in effect."
     if rows:
-        body += "\n\nVersions held back by compatibility constraints:\n\n| Package | Resolved | Latest stable |\n| --- | --- | --- |\n" + "\n".join(rows)
-    diff = git(checkout, "diff", base_sha, "--", "pubspec.yaml", "pubspec.lock")
-    if original[1] is None:
-        diff += "\nNew pubspec.lock:\n" + paths[1].read_text()
-    body += "\n\n```diff\n" + diff[:12000] + "\n```"
+        body += "\n\nUpdated direct dependencies (including dev dependencies):\n\n| Package | Previous | Updated |\n| --- | --- | --- |\n" + "\n".join(rows)
+    else:
+        body += "\n\nRefreshed dependency constraints or transitive dependencies; direct dependency versions are unchanged."
+    if held_back:
+        body += "\n\nVersions held back by compatibility constraints:\n\n| Package | Resolved | Latest stable |\n| --- | --- | --- |\n" + "\n".join(held_back)
     print(body, flush=True)
     return {"dependencies": dependencies, "pr-title": "chore(deps): update Flutter dependencies",
             "commit-message": "chore(deps): update Flutter dependencies", "pr-body": body}

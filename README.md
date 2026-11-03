@@ -61,7 +61,7 @@ excluding the authenticated account.
 flutter-bot --dry-run
 ```
 
-Dry-run resolves dependencies in the pipeline checkout, prints the proposed diff
+Dry-run resolves dependencies in the pipeline checkout, prints the proposed update summary
 and checks existing PRs, without committing, pushing branches or creating or
 modifying PRs. It leaves the proposed changes in the local checkout. Bitbucket
 discards that checkout when the step ends; when running locally, use a disposable
@@ -110,8 +110,10 @@ flutter pub outdated --json --no-prereleases --show-all
 `--major-versions` allows upgrades beyond existing upper bounds and updates
 constraints. `--tighten` raises dependency lower bounds to their resolved
 versions, including minor and patch updates. The lockfile records the exact
-resolved versions. The PR report lists packages held below their latest stable
-release by compatibility constraints.
+resolved versions. The PR description lists changed direct and dev dependencies with their previous
+and updated versions, followed by a table of versions held back by compatibility
+constraints. Full manifest and lockfile diffs are available in the PR
+file changes.
 
 Flutter SDK dependencies and their pins remain controlled by Flutter. The bot
 does not force incompatible versions, add dependency overrides, edit SDK
@@ -175,7 +177,7 @@ by adding `flutter --version` to the pipeline script.
 | --- | --- |
 | Authentication or permission errors | Use the account email for `BOT_USERNAME`; check token permissions, repository access and permission to push bot branches. |
 | Resolution fails | Check the image's Flutter/Dart versions, application SDK constraints, package conflicts and private dependency authentication. |
-| A dependency stays below its latest release | Check the PR's compatibility report and Flutter SDK pins. A newer version may need a newer SDK or changes to other dependencies. |
+| A dependency stays below its latest release | Check dependency constraints and Flutter SDK pins. A newer version may need a newer SDK or changes to other dependencies. |
 | Stable-only policy error | Check whether a direct dependency or dev dependency requires a prerelease. |
 | No PR appears | Check dry-run settings, whether files changed, and whether the same dependency-version set was previously declined. |
 | Missing or dirty checkout | Keep pipeline cloning enabled and run the bot before modifying files. Locally, use a clean repository root. |

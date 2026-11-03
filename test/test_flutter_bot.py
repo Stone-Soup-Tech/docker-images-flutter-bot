@@ -22,7 +22,7 @@ class ResolutionTests(unittest.TestCase):
         self.root = root
         (root / 'pubspec.yaml').write_text('name: example\n')
         if not missing_lock:
-            (root / 'pubspec.lock').write_text('old lock\n')
+            (root / 'pubspec.lock').write_text('packages:\n  example:\n    version: \"1.0.0\"\n  build_package:\n    version: \"1.0.0+1\"\n')
         self.git_commands = []
 
         def git(checkout, *arguments, **kwargs):
@@ -59,7 +59,12 @@ class ResolutionTests(unittest.TestCase):
         self.assertIn('--tighten', self.commands[1])
         self.assertIn('--no-prereleases', self.commands[2])
         self.assertIn('--show-all', self.commands[2])
+        self.assertIn('| example | 1.0.0 | 2.0.0 |', update['pr-body'])
+        self.assertNotIn('| build_package |', update['pr-body'])
+        self.assertNotIn('```diff', update['pr-body'])
         self.assertIn('| example | 2.0.0 | 3.0.0 |', update['pr-body'])
+        self.assertLess(update['pr-body'].index('Updated direct dependencies'),
+                        update['pr-body'].index('Versions held back'))
         self.assertEqual(update['dependencies'][1]['version'], '1.0.0+2')
         self.assertNotIn('secret', json.dumps(update))
         self.assertIn('GIT_CONFIG_VALUE_0', self.environment)
@@ -88,7 +93,8 @@ class ResolutionTests(unittest.TestCase):
             self.resolve(failing=True)
 
     def test_missing_lockfile_can_be_created(self):
-        self.assertIsNotNone(self.resolve(missing_lock=True))
+        update = self.resolve(missing_lock=True)
+        self.assertIn('| example | Not locked | 2.0.0 |', update['pr-body'])
 
     def test_dry_run_resolves_but_never_publishes(self):
         client = Mock()
