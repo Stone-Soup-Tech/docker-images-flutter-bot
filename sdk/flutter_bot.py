@@ -273,7 +273,8 @@ def run_updates(checkout, client, base_sha):
         raise ValueError("No pubspec.yaml in the selected directory")
     original = [path.read_bytes() if path.exists() else None for path in paths]
     # Pub selects stable releases unless a package already uses a prerelease.
-    # Reject prerelease results below, so this bot never publishes them silently.
+    # Enforce stable versions for direct dependencies, including dev dependencies.
+    # Transitive prereleases are controlled by the packages that require them.
     pub(project, environment, "upgrade", "--major-versions", "--no-precompile", "--no-example")
     pub(project, environment, "upgrade", "--tighten", "--no-precompile", "--no-example")
     allowed = {str(path.relative_to(checkout)) for path in paths}
@@ -284,9 +285,10 @@ def run_updates(checkout, client, base_sha):
     report = json.loads(pub(project, environment, "outdated", "--json", "--no-prereleases", "--show-all", capture=True))
     packages = report["packages"]
     prereleases = [p["package"] for p in packages
-                   if p.get("current") and "-" in p["current"]["version"].split("+", 1)[0]]
+                   if p.get("kind") in ("direct", "dev") and p.get("current")
+                   and "-" in p["current"]["version"].split("+", 1)[0]]
     if prereleases:
-        raise RuntimeError("Stable-only policy: resolution contains prereleases: " + ", ".join(prereleases))
+        raise RuntimeError("Stable-only policy: direct dependencies contain prereleases: " + ", ".join(prereleases))
     updated = [path.read_bytes() for path in paths]
     if original == updated:
         return None
@@ -299,7 +301,7 @@ def run_updates(checkout, client, base_sha):
             dependencies.append({"name": package["package"], "version": current})
         if current and latest and current != latest:
             rows.append(f"| {package['package']} | {current} | {latest} |")
-    body = "Updates Pub constraints and lockfile to the newest mutually compatible stable versions."
+    body = "Updates direct dependency constraints to the newest mutually compatible stable versions and refreshes the lockfile."
     body += "\n\nFlutter SDK pins and package compatibility constraints remain in effect."
     if rows:
         body += "\n\nVersions held back by compatibility constraints:\n\n| Package | Resolved | Latest stable |\n| --- | --- | --- |\n" + "\n".join(rows)

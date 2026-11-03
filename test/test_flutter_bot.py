@@ -11,7 +11,7 @@ from scripts.base_image import record_digest
 
 
 class ResolutionTests(unittest.TestCase):
-    def resolve(self, *, changed=True, prerelease=False, failing=False, missing_lock=False, workspace=False):
+    def resolve(self, *, changed=True, prerelease=False, prerelease_kind='direct', failing=False, missing_lock=False, workspace=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -41,7 +41,7 @@ class ResolutionTests(unittest.TestCase):
                 (checkout / 'pubspec.lock').write_text('new lock\n')
             if arguments[0] == 'outdated':
                 return json.dumps({'packages': [
-                    {'package': 'example', 'kind': 'direct',
+                    {'package': 'example', 'kind': prerelease_kind,
                      'current': {'version': '2.0.0-rc.1' if prerelease else '2.0.0'},
                      'latest': {'version': '3.0.0'}},
                     {'package': 'build_package', 'kind': 'transitive',
@@ -71,9 +71,17 @@ class ResolutionTests(unittest.TestCase):
     def test_no_changes_has_no_publishable_result(self):
         self.assertIsNone(self.resolve(changed=False))
 
-    def test_prerelease_is_never_published(self):
-        with self.assertRaisesRegex(RuntimeError, 'Stable-only policy'):
-            self.resolve(prerelease=True)
+    def test_direct_and_dev_prereleases_are_not_published(self):
+        for kind in ('direct', 'dev'):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(RuntimeError, 'direct dependencies contain prereleases: example'):
+                    self.resolve(prerelease=True, prerelease_kind=kind)
+
+    def test_transitive_prereleases_are_published(self):
+        for kind in ('transitive', 'transitive dev'):
+            with self.subTest(kind=kind):
+                update = self.resolve(prerelease=True, prerelease_kind=kind)
+                self.assertEqual(update['dependencies'][0]['version'], '2.0.0-rc.1')
 
     def test_solver_failure_has_no_publishable_result(self):
         with self.assertRaises(subprocess.CalledProcessError):

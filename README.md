@@ -94,7 +94,8 @@ such as Renovate for those dependency types; this image updates Pub dependencies
 
 The bot updates the repository root's `pubspec.yaml` and `pubspec.lock`, including
 direct and development dependencies and the resolved transitive dependency graph.
-It selects the newest mutually compatible **stable** versions across major,
+For direct dependencies, including dev dependencies, it selects the newest
+mutually compatible **stable** versions across major,
 minor, patch and build releases. For example, a compatible `1.2.3+4` can replace
 `1.2.3+3`. Selection follows Pub's version ordering, rather than publication date.
 
@@ -117,10 +118,10 @@ does not force incompatible versions, add dependency overrides, edit SDK
 constraints or upgrade Flutter during a run. Git/path dependencies follow their
 existing declarations; the bot does not discover new Git tags or rewrite paths.
 
-Resolution failures prevent publication. Projects that require prereleases can
-still resolve to them through Pub; the bot rejects any prerelease reported in the
-resolved graph to enforce its stable-only policy. Single application roots are
-supported. Multi-package workspaces are rejected if resolution changes Pub
+Resolution failures prevent publication. The bot rejects prereleases in direct
+dependencies, including dev dependencies. Transitive dependencies may resolve to
+prereleases required by their parent packages; these do not block publication.
+Single application roots are supported. Multi-package workspaces are rejected if resolution changes Pub
 manifests or lockfiles outside the root.
 
 ## Pull request behavior
@@ -175,7 +176,7 @@ by adding `flutter --version` to the pipeline script.
 | Authentication or permission errors | Use the account email for `BOT_USERNAME`; check token permissions, repository access and permission to push bot branches. |
 | Resolution fails | Check the image's Flutter/Dart versions, application SDK constraints, package conflicts and private dependency authentication. |
 | A dependency stays below its latest release | Check the PR's compatibility report and Flutter SDK pins. A newer version may need a newer SDK or changes to other dependencies. |
-| Stable-only policy error | Check whether existing constraints or Git/path dependencies require a prerelease. |
+| Stable-only policy error | Check whether a direct dependency or dev dependency requires a prerelease. |
 | No PR appears | Check dry-run settings, whether files changed, and whether the same dependency-version set was previously declined. |
 | Missing or dirty checkout | Keep pipeline cloning enabled and run the bot before modifying files. Locally, use a clean repository root. |
 | Base or update branch changed | Rerun the pipeline; avoid editing bot-owned update branches. |
