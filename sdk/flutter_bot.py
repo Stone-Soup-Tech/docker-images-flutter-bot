@@ -7,11 +7,9 @@ import base64
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
-import signal
+from pathlib import Path
 import re
 import subprocess
-import tempfile
 import time
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlparse
@@ -138,44 +136,35 @@ def git(directory, *arguments, env=None):
     return result.stdout.strip()
 
 
-def apply_files(directory, files):
-    """Apply text, binary and executable changes, rejecting paths outside the checkout."""
-    for file in files:
-        if file.get("support_file"):
-            continue
-
-        relative = PurePosixPath(file["directory"].lstrip("/")) / file["name"]
-        if relative.is_absolute() or ".." in relative.parts or any(part.lower() == ".git" for part in relative.parts):
-            raise ValueError("Unsafe dependency file path")
-        target = directory / str(relative)
-        if any(parent.is_symlink() for parent in (target, *target.parents)
-               if parent != directory and parent.is_relative_to(directory)):
-            raise ValueError("Symlink dependency paths are unsupported")
-        if not target.resolve().is_relative_to(directory.resolve()) or target.is_symlink():
-            raise ValueError("Dependency file escapes the checkout")
-        if file.get("symlink_target"):
-            raise ValueError("Symlink dependency updates are unsupported")
-
-        if file.get("deleted") or file.get("operation") == "delete":
-            target.unlink(missing_ok=True)
-        else:
-            encoding = file.get("content_encoding") or "utf-8"
-            if encoding == "base64":
-                content = base64.b64decode(file["content"], validate=True)
-            elif encoding == "utf-8":
-                content = file["content"].encode()
-            else:
-                raise ValueError(f"Unsupported dependency file encoding: {encoding}")
-            mode = int(file["mode"], 8) if file.get("mode") else None
-            if mode is not None and mode not in (0o644, 0o755, 0o100644, 0o100755):
-                raise ValueError("Unsupported dependency file mode")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-            if mode is not None:
-                target.chmod(mode & 0o777)
+def repository_url(client):
+    return f"https://bitbucket.org/{client.repository}.git"
 
 
-def publish_update(directory, client, update, base_sha, dry_run):
+def check_base(client, base_sha):
+    if client.branch(client.base_branch) != base_sha:
+        raise RuntimeError("Base branch changed during the update; rerun the pipeline")
+
+
+def prepare_checkout(client):
+    """Validate the pipeline checkout before changing dependency files."""
+    checkout = Path(os.environ.get("BITBUCKET_CLONE_DIR", Path.cwd())).resolve()
+    try:
+        root = Path(git(checkout, "rev-parse", "--show-toplevel")).resolve()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        raise RuntimeError("No Git checkout found; enable the Bitbucket pipeline clone") from None
+    if root != checkout:
+        raise ValueError("Run flutter-bot at the repository root or set BITBUCKET_CLONE_DIR")
+    if git(checkout, "status", "--porcelain"):
+        raise RuntimeError("Checkout must be clean before running flutter-bot")
+    base_sha = git(checkout, "rev-parse", "HEAD")
+    expected_sha = os.environ.get("BITBUCKET_COMMIT")
+    if expected_sha and expected_sha != base_sha:
+        raise RuntimeError("Checkout does not match BITBUCKET_COMMIT; rerun the pipeline")
+    check_base(client, base_sha)
+    return checkout, base_sha
+
+
+def publish_update(checkout, client, update, base_sha, dry_run):
     """Create or refresh one grouped PR, using a lease to protect concurrent pushes."""
     update_branch = f"flutter-bot/dependencies-{client.base_branch}"
     fingerprint = hashlib.sha256(json.dumps(sorted(
@@ -201,47 +190,38 @@ def publish_update(directory, client, update, base_sha, dry_run):
 
     reviewers = client.reviewers() if not opened else None
     previous_sha = client.branch(update_branch)
-    checkout = directory / "repository"
-    checkout.mkdir()
-    environment = os.environ.copy()
+    environment = git_environment(client)
     environment.update({
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.https://bitbucket.org/.extraHeader",
-        "GIT_CONFIG_VALUE_0": "Authorization: Basic " + base64.b64encode(
-            f"{GIT_API_TOKEN_USERNAME}:{client.token}".encode()
-        ).decode(),
-        "GIT_TERMINAL_PROMPT": "0",
         "GIT_AUTHOR_NAME": "Flutter Bot", "GIT_COMMITTER_NAME": "Flutter Bot",
         "GIT_AUTHOR_EMAIL": "flutter-bot@users.noreply.github.com",
         "GIT_COMMITTER_EMAIL": "flutter-bot@users.noreply.github.com",
     })
-
-    git(checkout, "init", "--quiet")
-    git(checkout, "remote", "add", "origin", f"https://bitbucket.org/{client.repository}.git")
-    git(checkout, "fetch", "--depth=1", "origin", client.base_branch, env=environment)
-    if git(checkout, "rev-parse", "FETCH_HEAD") != base_sha:
-        raise RuntimeError("Base branch changed during the update; rerun the pipeline")
-    git(checkout, "checkout", "--detach", base_sha)
-
-    apply_files(checkout, update["updated-dependency-files"])
-    git(checkout, "add", "--all")
-    if not git(checkout, "diff", "--cached", "--name-only"):
+    if git(checkout, "rev-parse", "HEAD") != base_sha:
+        raise RuntimeError("Checkout commit changed during resolution; rerun the pipeline")
+    if git(checkout, "diff", "--cached", "--name-only"):
+        raise RuntimeError("Unexpected staged files; refusing to publish")
+    git(checkout, "add", "--", "pubspec.yaml", "pubspec.lock")
+    staged = git(checkout, "diff", "--cached", "--name-only").splitlines()
+    if not staged:
         print("No file changes to publish.")
         return
+    if set(staged) - {"pubspec.yaml", "pubspec.lock"}:
+        raise RuntimeError("Only root Pub files may be published")
 
     tree = git(checkout, "write-tree")
     unchanged = False
     if previous_sha:
-        git(checkout, "fetch", "--depth=1", "origin", update_branch, env=environment)
+        git(checkout, "fetch", "--no-tags", "--depth=1", repository_url(client), update_branch, env=environment)
         if git(checkout, "rev-parse", "FETCH_HEAD") != previous_sha:
             raise RuntimeError("Flutter Bot branch changed during the update; rerun the pipeline")
         unchanged = tree == git(checkout, "rev-parse", f"{previous_sha}^{{tree}}")
 
+    check_base(client, base_sha)
     if not unchanged:
         git(checkout, "commit", "--quiet", "-m",
             update.get("commit-message") or title, env=environment)
         git(checkout, "push", f"--force-with-lease=refs/heads/{update_branch}:{previous_sha or ''}",
-            "origin", f"HEAD:refs/heads/{update_branch}", env=environment)
+            repository_url(client), f"HEAD:refs/heads/{update_branch}", env=environment)
 
     payload = {"title": title, "description": description}
     if opened:
@@ -255,19 +235,17 @@ def publish_update(directory, client, update, base_sha, dry_run):
     print("Pull request: " + result["links"]["html"]["href"])
 
 
-def terminate(signum, frame):
-    """Unwind temporary-directory cleanup when the pipeline is terminated."""
-    raise SystemExit(128 + signum)
-
-
 def git_environment(client):
     """Authenticate Git and private Pub Git dependencies without writing secrets."""
     environment = os.environ.copy()
     environment.update({
         "CI": "true", "PUB_ENVIRONMENT": "flutter_bot",
-        "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
+        "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "2",
         "GIT_CONFIG_KEY_0": "http.https://bitbucket.org/.extraHeader",
-        "GIT_CONFIG_VALUE_0": "Authorization: Basic " + base64.b64encode(
+        # Clear checkout-supplied headers before supplying the publishing account.
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_KEY_1": "http.https://bitbucket.org/.extraHeader",
+        "GIT_CONFIG_VALUE_1": "Authorization: Basic " + base64.b64encode(
             f"{GIT_API_TOKEN_USERNAME}:{client.token}".encode()).decode(),
     })
     return environment
@@ -283,20 +261,10 @@ def pub(checkout, environment, *arguments, capture=False):
     return result.stdout if capture else None
 
 
-def run_updates(directory, client, base_sha):
-    """Resolve in a disposable checkout and publish only the two Pub files."""
-    checkout = directory / "resolution"
-    checkout.mkdir()
+def run_updates(checkout, client, base_sha):
+    """Resolve dependencies directly in the pipeline's disposable checkout."""
     environment = git_environment(client)
-    git(checkout, "init", "--quiet")
-    git(checkout, "remote", "add", "origin", f"https://bitbucket.org/{client.repository}.git")
-    git(checkout, "fetch", "--depth=1", "origin", client.base_branch, env=environment)
-    if git(checkout, "rev-parse", "FETCH_HEAD") != base_sha:
-        raise RuntimeError("Base branch changed before resolution; rerun the pipeline")
-    git(checkout, "checkout", "--detach", base_sha)
     project = checkout
-    if not project.resolve().is_relative_to(checkout.resolve()):
-        raise ValueError("Project directory escapes the checkout")
     paths = [project / name for name in ("pubspec.yaml", "pubspec.lock")]
     for path in paths:
         if path.is_symlink() or not path.resolve().is_relative_to(checkout.resolve()):
@@ -335,13 +303,13 @@ def run_updates(directory, client, base_sha):
     body += "\n\nFlutter SDK pins and package compatibility constraints remain in effect."
     if rows:
         body += "\n\nVersions held back by compatibility constraints:\n\n| Package | Resolved | Latest stable |\n| --- | --- | --- |\n" + "\n".join(rows)
-    body += "\n\n```diff\n" + git(checkout, "diff", "--", *[str(p.relative_to(checkout)) for p in paths])[:12000] + "\n```"
+    diff = git(checkout, "diff", base_sha, "--", "pubspec.yaml", "pubspec.lock")
+    if original[1] is None:
+        diff += "\nNew pubspec.lock:\n" + paths[1].read_text()
+    body += "\n\n```diff\n" + diff[:12000] + "\n```"
     print(body, flush=True)
     return {"dependencies": dependencies, "pr-title": "chore(deps): update Flutter dependencies",
-            "commit-message": "chore(deps): update Flutter dependencies", "pr-body": body,
-            "updated-dependency-files": [
-                {"directory": "/", "name": path.name,
-                 "content": path.read_text()} for path in paths]}
+            "commit-message": "chore(deps): update Flutter dependencies", "pr-body": body}
 
 
 def main(argv=None):
@@ -351,19 +319,14 @@ def main(argv=None):
     dry_run = os.environ.get("FLUTTER_BOT_DRY_RUN", "false")
     if dry_run not in ("true", "false"):
         parser.error("FLUTTER_BOT_DRY_RUN must be true or false")
-    signal.signal(signal.SIGTERM, terminate)
     client = Bitbucket()
-    base_sha = client.branch(client.base_branch)
-    if not base_sha:
-        raise RuntimeError("Base branch does not exist")
-    with tempfile.TemporaryDirectory(prefix="flutter-bot-") as temporary:
-        directory = Path(temporary)
-        update = run_updates(directory, client, base_sha)
-        if update:
-            publish_update(directory, client, update, base_sha,
-                           arguments.dry_run or dry_run == "true")
-        else:
-            print("No dependency updates found.")
+    checkout, base_sha = prepare_checkout(client)
+    update = run_updates(checkout, client, base_sha)
+    if update:
+        publish_update(checkout, client, update, base_sha,
+                       arguments.dry_run or dry_run == "true")
+    else:
+        print("No dependency updates found.")
 
 
 if __name__ == "__main__":

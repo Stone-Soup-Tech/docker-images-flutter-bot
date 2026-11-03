@@ -19,13 +19,14 @@ class ResolutionTests(unittest.TestCase):
         self.environment = None
         client = Mock(repository='workspace/repo', token='secret', base_branch='dev')
 
+        self.root = root
+        (root / 'pubspec.yaml').write_text('name: example\n')
+        if not missing_lock:
+            (root / 'pubspec.lock').write_text('old lock\n')
+        self.git_commands = []
+
         def git(checkout, *arguments, **kwargs):
-            if arguments[0] == 'checkout':
-                (checkout / 'pubspec.yaml').write_text('name: example\n')
-                if not missing_lock:
-                    (checkout / 'pubspec.lock').write_text('old lock\n')
-            if arguments[0] == 'rev-parse':
-                return 'base'
+            self.git_commands.append(arguments)
             if arguments[:2] == ('diff', '--name-only') and workspace:
                 return 'other/pubspec.yaml'
             return ''
@@ -51,7 +52,9 @@ class ResolutionTests(unittest.TestCase):
 
     def test_major_minor_patch_and_build_resolution_updates_both_files(self):
         update = self.resolve()
-        self.assertEqual([p['name'] for p in update['updated-dependency-files']], ['pubspec.yaml', 'pubspec.lock'])
+        self.assertIn('^2.0.0', (self.root / 'pubspec.yaml').read_text())
+        self.assertEqual((self.root / 'pubspec.lock').read_text(), 'new lock\n')
+        self.assertTrue(all(command[0] == 'diff' for command in self.git_commands))
         self.assertIn('--major-versions', self.commands[0])
         self.assertIn('--tighten', self.commands[1])
         self.assertIn('--no-prereleases', self.commands[2])
@@ -83,6 +86,7 @@ class ResolutionTests(unittest.TestCase):
         client = Mock()
         client.branch.return_value = 'base'
         with patch.object(bot, 'Bitbucket', return_value=client), \
+                patch.object(bot, 'prepare_checkout', return_value=(Path('checkout'), 'base')), \
                 patch.object(bot, 'run_updates', return_value={'dependencies': []}), \
                 patch.object(bot, 'publish_update') as publish:
             bot.main(['--dry-run'])
@@ -99,6 +103,7 @@ class ResolutionTests(unittest.TestCase):
         client = Mock()
         client.branch.return_value = 'base'
         with patch.object(bot, 'Bitbucket', return_value=client), \
+                patch.object(bot, 'prepare_checkout', return_value=(Path('checkout'), 'base')), \
                 patch.object(bot, 'run_updates', return_value={'dependencies': []}), \
                 patch.object(bot, 'publish_update') as publish:
             bot.main([])

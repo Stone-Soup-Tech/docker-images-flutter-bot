@@ -12,8 +12,6 @@ pipelines:
           name: Update Flutter dependencies
           image: ghcr.io/stone-soup-tech/flutter-bot:latest
           max-time: 30
-          clone:
-            enabled: false
           concurrency-group: flutter-bot-pub
           caches:
             - flutter-bot-pub
