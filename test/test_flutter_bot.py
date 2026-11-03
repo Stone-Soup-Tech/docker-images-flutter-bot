@@ -59,15 +59,34 @@ class ResolutionTests(unittest.TestCase):
         self.assertIn('--tighten', self.commands[1])
         self.assertIn('--no-prereleases', self.commands[2])
         self.assertIn('--show-all', self.commands[2])
-        self.assertIn('| example | 1.0.0 | 2.0.0 |', update['pr-body'])
-        self.assertNotIn('| build_package |', update['pr-body'])
+        self.assertIn('| [example](https://pub.dev/packages/example) | dependencies | `1.0.0` | `^2.0.0` |', update['pr-body'])
+        self.assertNotIn('| [build_package](https://pub.dev/packages/build_package) |', update['pr-body'])
         self.assertNotIn('```diff', update['pr-body'])
-        self.assertIn('| example | 2.0.0 | 3.0.0 |', update['pr-body'])
+        self.assertIn('| [example](https://pub.dev/packages/example) | dependencies | `2.0.0` | `3.0.0` |', update['pr-body'])
         self.assertLess(update['pr-body'].index('Updated direct dependencies'),
                         update['pr-body'].index('Versions held back'))
         self.assertEqual(update['dependencies'][1]['version'], '1.0.0+2')
         self.assertNotIn('secret', json.dumps(update))
         self.assertIn('GIT_CONFIG_VALUE_0', self.environment)
+
+    def test_dev_dependency_type_in_both_tables(self):
+        update = self.resolve(prerelease_kind='dev')
+        self.assertIn('| dev_dependencies | `1.0.0` | `^2.0.0` |', update['pr-body'])
+        self.assertIn('| dev_dependencies | `2.0.0` | `3.0.0` |', update['pr-body'])
+
+    def test_pubspec_constraint_styles(self):
+        constraints = bot.pubspec_constraints(b"""name: example
+dependencies:
+  caret: ^1.2.3
+  fixed: '2.3.4' # pinned
+  hosted:
+    hosted: https://pub.dev
+    version: "^3.4.5"
+dev_dependencies:
+  tool: ^4.5.6
+""")
+        self.assertEqual(constraints, {'caret': '^1.2.3', 'fixed': '2.3.4',
+                                       'hosted': '^3.4.5', 'tool': '^4.5.6'})
 
     def test_workspace_partial_updates_are_not_published(self):
         with self.assertRaisesRegex(RuntimeError, 'workspaces are unsupported'):
@@ -94,7 +113,7 @@ class ResolutionTests(unittest.TestCase):
 
     def test_missing_lockfile_can_be_created(self):
         update = self.resolve(missing_lock=True)
-        self.assertIn('| example | Not locked | 2.0.0 |', update['pr-body'])
+        self.assertIn('| [example](https://pub.dev/packages/example) | dependencies | Not locked | `^2.0.0` |', update['pr-body'])
 
     def test_dry_run_resolves_but_never_publishes(self):
         client = Mock()

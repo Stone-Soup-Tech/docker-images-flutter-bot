@@ -276,6 +276,32 @@ def lockfile_versions(content):
     return versions
 
 
+def pubspec_constraints(content):
+    """Read simple version constraints; leave complex YAML declarations unresolved."""
+    constraints = {}
+    section = None
+    package = None
+    for line in content.decode().splitlines():
+        if line and not line[0].isspace() and not line.startswith('#'):
+            section = line.split(':', 1)[0]
+            package = None
+        if section not in ('dependencies', 'dev_dependencies'):
+            continue
+        match = re.fullmatch(r"  ([A-Za-z0-9_]+):\s*(.*)", line)
+        if match:
+            package, value = match.groups()
+        else:
+            match = re.fullmatch(r"    version:\s*(.*)", line)
+            if not match or not package:
+                continue
+            value = match[1]
+        # Only use constraints whose syntax is unambiguous without a YAML parser.
+        match = re.fullmatch(r"[\"']?(\^?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?)[\"']?\s*(?:#.*)?", value)
+        if match:
+            constraints[package] = match[1]
+    return constraints
+
+
 def run_updates(checkout, client, base_sha):
     """Resolve dependencies directly in the pipeline's disposable checkout."""
     environment = git_environment(client)
@@ -308,27 +334,38 @@ def run_updates(checkout, client, base_sha):
     if original == updated:
         return None
     previous_versions = lockfile_versions(original[1])
+    previous_constraints = pubspec_constraints(original[0])
+    updated_constraints = pubspec_constraints(updated[0])
     rows = []
     held_back = []
     dependencies = []
     for package in packages:
+        package_link = f"[{package['package']}](https://pub.dev/packages/{package['package']})"
+        dependency_type = {
+            "direct": "dependencies", "dev": "dev_dependencies",
+            "transitive": "transitive", "transitive dev": "transitive (dev_dependencies)",
+        }.get(package.get("kind"), "unknown")
         current = (package.get("current") or {}).get("version")
         if current:
             dependencies.append({"name": package["package"], "version": current})
         latest = (package.get("latest") or {}).get("version")
         if current and latest and current != latest:
-            held_back.append(f"| {package['package']} | {current} | {latest} |")
+            held_back.append(f"| {package_link} | {dependency_type} | `{current}` | `{latest}` |")
         previous = previous_versions.get(package["package"])
-        if package.get("kind") in ("direct", "dev") and current and current != previous:
-            rows.append(f"| {package['package']} | {previous or 'Not locked'} | {current} |")
+        if package.get("kind") in ("direct", "dev") and current and (current != previous or previous_constraints.get(package["package"])
+                                             != updated_constraints.get(package["package"])):
+            previous_constraint = previous_constraints.get(package["package"], previous)
+            updated_constraint = updated_constraints.get(package["package"], current)
+            previous_display = f"`{previous_constraint}`" if previous_constraint else "Not locked"
+            rows.append(f"| {package_link} | {dependency_type} | {previous_display} | `{updated_constraint}` |")
     body = "Updates direct dependency constraints to the newest mutually compatible stable versions and refreshes the lockfile."
     body += "\n\nFlutter SDK pins and package compatibility constraints remain in effect."
     if rows:
-        body += "\n\nUpdated direct dependencies (including dev dependencies):\n\n| Package | Previous | Updated |\n| --- | --- | --- |\n" + "\n".join(rows)
+        body += "\n\nUpdated direct dependencies (including dev dependencies):\n\n| Package | Type | Previous | Updated |\n| --- | --- | --- | --- |\n" + "\n".join(rows)
     else:
         body += "\n\nRefreshed dependency constraints or transitive dependencies; direct dependency versions are unchanged."
     if held_back:
-        body += "\n\nVersions held back by compatibility constraints:\n\n| Package | Resolved | Latest stable |\n| --- | --- | --- |\n" + "\n".join(held_back)
+        body += "\n\nVersions held back by compatibility constraints:\n\n| Package | Type | Resolved | Latest stable |\n| --- | --- | --- | --- |\n" + "\n".join(held_back)
     print(body, flush=True)
     return {"dependencies": dependencies, "pr-title": "chore(deps): update Flutter dependencies",
             "commit-message": "chore(deps): update Flutter dependencies", "pr-body": body}
