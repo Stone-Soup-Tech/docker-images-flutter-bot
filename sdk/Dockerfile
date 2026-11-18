@@ -14,5 +14,5 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PUB_CACHE=/opt/pub-cache \
     CI=true
 WORKDIR /build
-# No entrypoint: allow Bitbucket to execute step shell scripts.
+# No entrypoint: allow Bitbucket and Azure Pipelines to execute job scripts.
 CMD ["/bin/bash"]

@@ -1,0 +1,42 @@
+# Azure DevOps Services / Azure Repos Git. Merge into your existing pipeline.
+trigger: none
+pr: none
+
+parameters:
+  - name: dryRun
+    displayName: Resolve updates without publishing
+    type: boolean
+    default: true
+
+# Scheduling details: README.md, "Azure scheduling and validation".
+# Uncomment after a successful manual publishing run. Scheduled runs use the
+# parameter default, so also change dryRun's default to false to publish.
+# schedules:
+#   - cron: '0 6 * * 1' # Monday at 06:00 UTC (no daylight saving adjustment)
+#     displayName: Weekly Flutter dependency updates
+#     branches:
+#       include: [main]
+#     always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - job: FlutterDependencyUpdates
+    timeoutInMinutes: 30
+    container: ghcr.io/stone-soup-tech/flutter-bot:latest
+    steps:
+      - checkout: self
+        clean: true
+        persistCredentials: false
+      - task: Cache@2
+        inputs:
+          key: 'flutter-bot-pub | "$(Agent.OS)" | pubspec.yaml'
+          restoreKeys: |
+            flutter-bot-pub | "$(Agent.OS)"
+          path: /opt/pub-cache
+      - bash: flutter-bot --provider azure
+        displayName: Update Flutter dependencies
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          FLUTTER_BOT_DRY_RUN: ${{ lower(parameters.dryRun) }}

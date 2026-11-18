@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
-"""Run Flutter Bot and maintain one grouped Bitbucket PR."""
+"""Run Flutter Bot and maintain one grouped dependency PR."""
 
 import argparse
+from abc import ABC, abstractmethod
 import base64
 import hashlib
 import json
@@ -31,8 +32,44 @@ def urlopen(request, timeout):
     return build_opener(NoRedirect).open(request, timeout=timeout)
 
 
-class Bitbucket:
+class Provider(ABC):
+    """Platform boundary; PRs use id, state (OPEN/DECLINED), description."""
+
+    @abstractmethod
+    def branch(self, name):
+        """Return the exact branch SHA, or None."""
+
+    @abstractmethod
+    def pull_requests(self, update_branch):
+        """Return open and declined PRs for the source and target branches."""
+
+    @abstractmethod
+    def save_pull_request(self, opened, update_branch, title, description):
+        """Create or refresh a PR and return its browser URL."""
+
+    @abstractmethod
+    def git_auth(self):
+        """Return (URL scope, Authorization header value)."""
+
+    @property
+    @abstractmethod
+    def repository_url(self):
+        """Credential-free HTTPS clone URL."""
+
+    def validate_branch(self):
+        if not self.base_branch:
+            raise ValueError("Repository has no default branch")
+        if self.base_branch.startswith("flutter-bot/"):
+            raise ValueError("Run the bot on an application branch, not its own update branch")
+        git(Path.cwd(), "check-ref-format", "--branch", self.base_branch)
+
+
+class Bitbucket(Provider):
     """Access Bitbucket with the configured bot account and API token."""
+
+    name = "Bitbucket"
+    checkout_variable = "BITBUCKET_CLONE_DIR"
+    commit_variable = "BITBUCKET_COMMIT"
 
     def __init__(self, base_branch=None):
         self.base_branch = base_branch
@@ -51,11 +88,7 @@ class Bitbucket:
         if not self.base_branch:
             repository = self.request(self.repo_path)
             self.base_branch = (repository.get("mainbranch") or {}).get("name")
-        if not self.base_branch:
-            raise ValueError("Repository has no default branch")
-        if self.base_branch.startswith("flutter-bot/"):
-            raise ValueError("Run the bot on an application branch, not its own update branch")
-        git(Path.cwd(), "check-ref-format", "--branch", self.base_branch)
+        self.validate_branch()
 
     def request(self, path, method="GET", data=None):
         """Make an authenticated request without following external pagination URLs."""
@@ -126,6 +159,151 @@ class Bitbucket:
         return [{"uuid": user["uuid"]} for user in candidates
                 if user["uuid"] != current_user]
 
+    @property
+    def repository_url(self):
+        return f"https://bitbucket.org/{self.repository}.git"
+
+    def git_auth(self):
+        encoded = base64.b64encode(f"{GIT_API_TOKEN_USERNAME}:{self.token}".encode()).decode()
+        return "https://bitbucket.org/", "Basic " + encoded
+
+    def save_pull_request(self, opened, update_branch, title, description):
+        payload = {"title": title, "description": description}
+        if opened:
+            result = self.request(f"{self.repo_path}/pullrequests/{opened['id']}", "PUT", payload)
+        else:
+            payload.update({"source": {"branch": {"name": update_branch}},
+                            "destination": {"branch": {"name": self.base_branch}},
+                            "close_source_branch": True, "reviewers": self.reviewers()})
+            result = self.request(f"{self.repo_path}/pullrequests", "POST", payload)
+        return result["links"]["html"]["href"]
+
+
+class Azure(Provider):
+    """Azure DevOps Services using the pipeline job's OAuth token."""
+
+    name = "Azure DevOps"
+    checkout_variable = "BUILD_SOURCESDIRECTORY"
+    commit_variable = "BUILD_SOURCEVERSION"
+
+    def __init__(self):
+        collection = os.environ["SYSTEM_COLLECTIONURI"]
+        # Constrain both REST and Git credentials to a single cloud organization.
+        if not re.fullmatch(r"https://dev\.azure\.com/[A-Za-z0-9_-]+/?", collection):
+            raise ValueError("SYSTEM_COLLECTIONURI must be https://dev.azure.com/<organization>/")
+        self.collection = collection.rstrip("/") + "/"
+        project = quote(os.environ["SYSTEM_TEAMPROJECTID"], safe="")
+        repository = quote(os.environ["BUILD_REPOSITORY_ID"], safe="")
+        self.repo_path = f"{project}/_apis/git/repositories/{repository}"
+        self.token = os.environ["SYSTEM_ACCESSTOKEN"]
+        if not self.token:
+            raise ValueError("Map System.AccessToken to SYSTEM_ACCESSTOKEN")
+        self.authorization = "Bearer " + self.token
+        self._repository_url = f"{self.collection}{project}/_git/{repository}"
+        branch = os.environ.get("BUILD_SOURCEBRANCH")
+        if not branch:
+            branch = self.request(self.repo_path).get("defaultBranch")
+        if not branch or not branch.startswith("refs/heads/"):
+            raise ValueError("Run Azure updates on a branch (refs/heads/...), not a PR or tag")
+        self.base_branch = branch[len("refs/heads/"):]
+        self.validate_branch()
+
+    @property
+    def repository_url(self):
+        return self._repository_url
+
+    def git_auth(self):
+        return self.collection, self.authorization
+
+    def request(self, path, method="GET", data=None):
+        # Paths are generated internally; never accept a remote pagination URL.
+        if path.startswith("/") or ":" in path or ".." in path.split("/"):
+            raise ValueError("Unexpected Azure API path")
+        url = self.collection + path + ("&" if "?" in path else "?") + "api-version=7.1"
+        request = Request(url, data=json.dumps(data).encode() if data is not None else None,
+                          method=method, headers={"Authorization": self.authorization,
+                          "Content-Type": "application/json", "Accept": "application/json"})
+        try:
+            with urlopen(request, timeout=60) as response:
+                payload = json.load(response)
+                continuation = response.headers.get("x-ms-continuationtoken")
+                if continuation:
+                    payload["_continuation"] = continuation
+                return payload
+        except HTTPError as error:
+            detail = ""
+            try:
+                detail = json.loads(error.read(16384)).get("message", "")
+            except (ValueError, AttributeError):
+                pass
+            finally:
+                error.close()
+            if isinstance(detail, str):
+                for secret in (self.authorization, self.token):
+                    detail = detail.replace(secret, "[REDACTED]")
+                detail = " — " + " ".join(detail.split())[:1000] if detail else ""
+            else:
+                detail = ""
+            raise RuntimeError(f"Azure {method} request failed: HTTP {error.code}{detail}") from None
+
+    def branch(self, name):
+        continuation = None
+        while True:
+            parameters = {"filter": "heads/" + name, "$top": 1000}
+            if continuation:
+                parameters["continuationToken"] = continuation
+            page = self.request(f"{self.repo_path}/refs?{urlencode(parameters)}")
+            for ref in page["value"]:
+                if ref["name"] == "refs/heads/" + name:
+                    return ref["objectId"]
+            continuation = page.get("_continuation")
+            if not continuation:
+                return None
+
+    def pull_requests(self, update_branch):
+        result = []
+        for status, state in (("active", "OPEN"), ("abandoned", "DECLINED")):
+            skip = 0
+            while True:
+                query = urlencode({"searchCriteria.status": status,
+                    "searchCriteria.sourceRefName": "refs/heads/" + update_branch,
+                    "searchCriteria.targetRefName": "refs/heads/" + self.base_branch,
+                    "$top": 100, "$skip": skip})
+                page = self.request(f"{self.repo_path}/pullrequests?{query}")["value"]
+                result.extend({"id": pr["pullRequestId"], "state": state,
+                               "description": pr.get("description", "")} for pr in page)
+                if not page:
+                    break
+                skip += len(page)
+        return result
+
+    def save_pull_request(self, opened, update_branch, title, description):
+        payload = {"title": title, "description": description}
+        path = f"{self.repo_path}/pullrequests"
+        if opened:
+            path += f"/{opened['id']}"
+        else:
+            payload.update({"sourceRefName": "refs/heads/" + update_branch,
+                            "targetRefName": "refs/heads/" + self.base_branch})
+        result = self.request(path, "PATCH" if opened else "POST", payload)
+        return self.repository_url + "/pullrequest/" + str(result["pullRequestId"])
+
+
+def select_provider(explicit):
+    if explicit == "azure":
+        return Azure()
+    if explicit == "bitbucket":
+        return Bitbucket()
+    azure = os.environ.get("TF_BUILD", "").lower() == "true"
+    bitbucket = bool(os.environ.get("BITBUCKET_REPO_FULL_NAME"))
+    if azure and bitbucket:
+        raise ValueError("Ambiguous pipeline environment; specify --provider")
+    if azure:
+        return Azure()
+    if bitbucket:
+        return Bitbucket()
+    raise ValueError("No pipeline provider detected; specify --provider bitbucket or --provider azure")
+
 
 def git(directory, *arguments, env=None):
     """Run Git without storing credentials in command arguments or config files."""
@@ -137,7 +315,7 @@ def git(directory, *arguments, env=None):
 
 
 def repository_url(client):
-    return f"https://bitbucket.org/{client.repository}.git"
+    return client.repository_url
 
 
 def check_base(client, base_sha):
@@ -147,19 +325,19 @@ def check_base(client, base_sha):
 
 def prepare_checkout(client):
     """Validate the pipeline checkout before changing dependency files."""
-    checkout = Path(os.environ.get("BITBUCKET_CLONE_DIR", Path.cwd())).resolve()
+    checkout = Path(os.environ.get(client.checkout_variable, Path.cwd())).resolve()
     try:
         root = Path(git(checkout, "rev-parse", "--show-toplevel")).resolve()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        raise RuntimeError("No Git checkout found; enable the Bitbucket pipeline clone") from None
+        raise RuntimeError(f"No Git checkout found; enable the {client.name} pipeline clone") from None
     if root != checkout:
-        raise ValueError("Run flutter-bot at the repository root or set BITBUCKET_CLONE_DIR")
+        raise ValueError(f"Run flutter-bot at the repository root or set {client.checkout_variable}")
     if git(checkout, "status", "--porcelain"):
         raise RuntimeError("Checkout must be clean before running flutter-bot")
     base_sha = git(checkout, "rev-parse", "HEAD")
-    expected_sha = os.environ.get("BITBUCKET_COMMIT")
+    expected_sha = os.environ.get(client.commit_variable)
     if expected_sha and expected_sha != base_sha:
-        raise RuntimeError("Checkout does not match BITBUCKET_COMMIT; rerun the pipeline")
+        raise RuntimeError(f"Checkout does not match {client.commit_variable}; rerun the pipeline")
     check_base(client, base_sha)
     return checkout, base_sha
 
@@ -188,7 +366,6 @@ def publish_update(checkout, client, update, base_sha, dry_run):
         print("Dry run: no branches or pull requests changed.")
         return
 
-    reviewers = client.reviewers() if not opened else None
     previous_sha = client.branch(update_branch)
     environment = git_environment(client)
     environment.update({
@@ -223,30 +400,21 @@ def publish_update(checkout, client, update, base_sha, dry_run):
         git(checkout, "push", f"--force-with-lease=refs/heads/{update_branch}:{previous_sha or ''}",
             repository_url(client), f"HEAD:refs/heads/{update_branch}", env=environment)
 
-    payload = {"title": title, "description": description}
-    if opened:
-        result = client.request(f"{client.repo_path}/pullrequests/{opened[0]['id']}",
-                                "PUT", payload)
-    else:
-        payload.update({"source": {"branch": {"name": update_branch}},
-                        "destination": {"branch": {"name": client.base_branch}},
-                        "close_source_branch": True, "reviewers": reviewers})
-        result = client.request(f"{client.repo_path}/pullrequests", "POST", payload)
-    print("Pull request: " + result["links"]["html"]["href"])
+    url = client.save_pull_request(opened[0] if opened else None, update_branch, title, description)
+    print("Pull request: " + url)
 
 
 def git_environment(client):
     """Authenticate Git and private Pub Git dependencies without writing secrets."""
+    scope, authorization = client.git_auth()
     environment = os.environ.copy()
     environment.update({
         "CI": "true", "PUB_ENVIRONMENT": "flutter_bot",
         "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "2",
-        "GIT_CONFIG_KEY_0": "http.https://bitbucket.org/.extraHeader",
-        # Clear checkout-supplied headers before supplying the publishing account.
+        "GIT_CONFIG_KEY_0": f"http.{scope}.extraHeader",
         "GIT_CONFIG_VALUE_0": "",
-        "GIT_CONFIG_KEY_1": "http.https://bitbucket.org/.extraHeader",
-        "GIT_CONFIG_VALUE_1": "Authorization: Basic " + base64.b64encode(
-            f"{GIT_API_TOKEN_USERNAME}:{client.token}".encode()).decode(),
+        "GIT_CONFIG_KEY_1": f"http.{scope}.extraHeader",
+        "GIT_CONFIG_VALUE_1": "Authorization: " + authorization,
     })
     return environment
 
@@ -374,11 +542,13 @@ def run_updates(checkout, client, base_sha):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--provider", choices=("bitbucket", "azure"),
+                        help="Git hosting provider (required when no pipeline provider is detected)")
     arguments = parser.parse_args(argv)
     dry_run = os.environ.get("FLUTTER_BOT_DRY_RUN", "false")
     if dry_run not in ("true", "false"):
         parser.error("FLUTTER_BOT_DRY_RUN must be true or false")
-    client = Bitbucket()
+    client = select_provider(arguments.provider)
     checkout, base_sha = prepare_checkout(client)
     update = run_updates(checkout, client, base_sha)
     if update:
