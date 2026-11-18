@@ -8,13 +8,14 @@ from unittest.mock import Mock, patch
 
 from sdk import flutter_bot as bot
 from scripts.base_image import record_digest
+from sdk.pub_workspace import manifest_dependencies
 
 
 class ResolutionTests(unittest.TestCase):
     def resolve(self, *, changed=True, prerelease=False, prerelease_kind='direct', failing=False, missing_lock=False, workspace=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
+        root = Path(temporary.name).resolve()
         self.commands = []
         self.environment = None
         client = Mock(repository='workspace/repo', token='secret', base_branch='dev')
@@ -35,10 +36,16 @@ class ResolutionTests(unittest.TestCase):
         def pub(checkout, environment, *arguments, **kwargs):
             self.commands.append(arguments)
             self.environment = environment
-            if failing:
+            if failing and arguments[0] == 'upgrade':
                 raise subprocess.CalledProcessError(1, ['flutter', 'pub', *arguments])
+            if arguments[0] == 'workspace':
+                return json.dumps({'packages': [{'name': 'root_package', 'path': str(root)}]})
             if arguments[0] == 'upgrade' and changed:
-                (checkout / 'pubspec.yaml').write_text('name: example\ndependencies:\n  example: ^2.0.0\n')
+                section = 'dev_dependencies' if prerelease_kind == 'dev' else 'dependencies'
+                manifest = f'name: root_package\n{section}:\n  example: ^2.0.0\n'
+                if prerelease_kind.startswith('transitive'):
+                    manifest = 'name: root_package\n'
+                (checkout / 'pubspec.yaml').write_text(manifest)
                 (checkout / 'pubspec.lock').write_text('new lock\n')
             if arguments[0] == 'outdated':
                 return json.dumps({'packages': [
@@ -55,11 +62,11 @@ class ResolutionTests(unittest.TestCase):
         update = self.resolve()
         self.assertIn('^2.0.0', (self.root / 'pubspec.yaml').read_text())
         self.assertEqual((self.root / 'pubspec.lock').read_text(), 'new lock\n')
-        self.assertTrue(all(command[0] == 'diff' for command in self.git_commands))
-        self.assertIn('--major-versions', self.commands[0])
-        self.assertIn('--tighten', self.commands[1])
-        self.assertIn('--no-prereleases', self.commands[2])
-        self.assertIn('--show-all', self.commands[2])
+        self.assertTrue(all(command[0] in ('diff', 'ls-files') for command in self.git_commands))
+        self.assertIn('--major-versions', self.commands[1])
+        self.assertIn('--tighten', self.commands[2])
+        self.assertIn('--no-prereleases', self.commands[3])
+        self.assertIn('--show-all', self.commands[3])
         self.assertIn('| [example](https://pub.dev/packages/example) | dependencies | `1.0.0` | `^2.0.0` |', update['pr-body'])
         self.assertNotIn('| [build_package](https://pub.dev/packages/build_package) |', update['pr-body'])
         self.assertNotIn('```diff', update['pr-body'])
@@ -76,7 +83,7 @@ class ResolutionTests(unittest.TestCase):
         self.assertIn('| dev_dependencies | `2.0.0` | `3.0.0` |', update['pr-body'])
 
     def test_pubspec_constraint_styles(self):
-        constraints = bot.pubspec_constraints(b"""name: example
+        dependencies = manifest_dependencies(b"""name: example
 dependencies:
   caret: ^1.2.3
   fixed: '2.3.4' # pinned
@@ -86,11 +93,12 @@ dependencies:
 dev_dependencies:
   tool: ^4.5.6
 """)
+        constraints = {name: value for (_, name), value in dependencies.items()}
         self.assertEqual(constraints, {'caret': '^1.2.3', 'fixed': '2.3.4',
                                        'hosted': '^3.4.5', 'tool': '^4.5.6'})
 
     def test_workspace_partial_updates_are_not_published(self):
-        with self.assertRaisesRegex(RuntimeError, 'workspaces are unsupported'):
+        with self.assertRaisesRegex(RuntimeError, 'outside the workspace'):
             self.resolve(workspace=True)
 
     def test_no_changes_has_no_publishable_result(self):

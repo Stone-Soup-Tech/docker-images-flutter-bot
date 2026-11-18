@@ -206,8 +206,10 @@ defaults to `false`; `--dry-run` always enables dry-run. Use `--provider` to cho
 
 ## What gets updated
 
-The bot updates the repository root's `pubspec.yaml` and `pubspec.lock`, including
+The bot updates a single root package or a native Dart Pub workspace, including
 direct and development dependencies and the resolved transitive dependency graph.
+For workspaces, it updates every member's `pubspec.yaml` and the shared root
+`pubspec.lock` in one grouped PR.
 For direct dependencies, including dev dependencies, it selects the newest
 mutually compatible **stable** versions across major,
 minor, patch and build releases. For example, a compatible `1.2.3+4` can replace
@@ -237,8 +239,61 @@ existing declarations; the bot does not discover new Git tags or rewrite paths.
 Resolution failures prevent publication. The bot rejects prereleases in direct
 dependencies, including dev dependencies. Transitive dependencies may resolve to
 prereleases required by their parent packages; these do not block publication.
-Single application roots are supported. Multi-package workspaces are rejected if resolution changes Pub
-manifests or lockfiles outside the root.
+Single root packages and native Pub workspaces are supported. Pub file changes
+outside the discovered workspace prevent publication.
+
+## Multi-package workspaces and Melos
+
+Run `flutter-bot` from the repository root, which must also be the Pub workspace
+root. No extra bot parameter or Melos installation is needed. For example:
+
+```yaml
+# pubspec.yaml at the repository root
+name: my_workspace
+publish_to: none
+environment:
+  sdk: ^3.6.0
+workspace:
+  - apps/mobile
+  - packages/shared
+```
+
+Each member must use native workspace resolution:
+
+```yaml
+# packages/shared/pubspec.yaml
+name: shared
+version: 1.0.0
+resolution: workspace
+environment:
+  sdk: ^3.6.0
+```
+
+The bot discovers packages with `dart pub workspace list --json`. Pub interprets
+your workspace declarations, including nested workspaces and glob patterns
+supported by the image's Dart SDK. The two upgrade commands run once at the root
+and update all member constraints together. The PR summary identifies each changed
+dependency's manifest and whether it is a dependency or dev dependency. Workspace
+packages are excluded from external package update rows.
+
+Commit the shared root lockfile. Remove any leftover member `pubspec.lock` files
+before running the bot; it rejects them rather than letting Pub delete them during
+resolution. Member paths and Pub files must stay inside the checkout and must not
+be symlinks. Only discovered manifests and the shared lockfile are staged;
+Melos configuration, scripts, and generated files are left alone.
+
+This covers **Melos 7+** projects using native Pub workspaces. The bot does not run
+Melos bootstrap hooks or scripts. Legacy Melos repositories using independent
+package resolution, and collections of independent packages with separate
+lockfiles, are not supported as multi-package updates. Root-package behavior
+continues to work without a `workspace` declaration.
+
+The image must include **Dart 3.13+** for `dart pub workspace list --json`.
+Project SDK constraints may still allow older versions (such as `^3.6.0` above);
+resolution runs with the SDK installed in the image. Newer workspace syntax and
+your Melos version can require a newer SDK. See [Pub workspaces](https://dart.dev/tools/pub/workspaces),
+[workspace upgrades](https://dart.dev/tools/pub/cmd/pub-upgrade#in-a-workspace), and
+the [Melos migration guide](https://invertase.docs.page/melos/guides/migrations).
 
 ## Pull request behavior
 
@@ -250,6 +305,8 @@ Unchanged file trees do not create duplicate commits. Declining a PR suppresses
 the same resolved dependency-version set until versions change. Runs with no
 file changes leave existing PRs open. Bitbucket default reviewers are assigned when a PR
 is created; Azure reviewers follow branch policies.
+Azure summaries that exceed its API description limit are shortened, preserving
+the update marker; full details remain in pipeline logs and the file diff.
 
 Treat update branches as bot-owned: the bot replaces their contents when
 refreshing updates. Before publishing, it checks the remote base branch again.
@@ -260,7 +317,8 @@ branch, like any other PR. Force-with-lease protects the bot branch against
 concurrent pushes. Running the updater
 on its own `flutter-bot/*` branches is rejected.
 
-Only `pubspec.yaml` and `pubspec.lock` are staged for the dependency commit.
+Only the discovered `pubspec.yaml` files and the root `pubspec.lock` are staged
+for the dependency commit.
 Generated files are left in the disposable checkout. Existing staged or unstaged
 changes at startup are rejected to avoid mixing them with dependency updates.
 The pipeline disposes of the checkout when the step ends.

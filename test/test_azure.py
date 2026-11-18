@@ -39,10 +39,12 @@ class AzureTests(unittest.TestCase):
     def test_pr_pagination_and_state_normalization(self):
         with patch.object(self.client, 'request', side_effect=[
             {'value': [{'pullRequestId': 1}]}, {'value': []},
-            {'value': [{'pullRequestId': 2, 'description': 'marker'}]}, {'value': []},
+            {'value': [{'pullRequestId': 2, 'description': 'truncated'}]},
+            {'description': 'complete marker'}, {'value': []},
         ]) as request:
             prs = self.client.pull_requests('flutter-bot/dependencies-dev')
         self.assertEqual([pr['state'] for pr in prs], ['OPEN', 'DECLINED'])
+        self.assertEqual(prs[1]['description'], 'complete marker')
         query = parse_qs(urlparse(request.call_args_list[1].args[0]).query)
         self.assertEqual(query['$skip'], ['1'])
         self.assertEqual(query['searchCriteria.targetRefName'], ['refs/heads/dev'])
@@ -56,6 +58,16 @@ class AzureTests(unittest.TestCase):
             self.client.save_pull_request({'id': 5}, 'branch', 'title', 'body')
             self.assertEqual(request.call_args.args[1], 'PATCH')
             self.assertEqual(request.call_args.args[2], {'title': 'title', 'description': 'body'})
+
+    def test_long_description_keeps_marker_and_fits_azure_limit(self):
+        marker = '<!-- flutter-bot-update:' + 'a' * 64 + ' -->'
+        description = ('A long dependency row 😀\n' * 300) + '\n\n' + marker
+        with patch.object(self.client, 'request', return_value={'pullRequestId': 5}) as request:
+            self.client.save_pull_request({'id': 5}, 'branch', 'title', description)
+        published = request.call_args.args[2]['description']
+        self.assertLessEqual(len(published.encode('utf-16-le')) // 2, 4000)
+        self.assertTrue(published.endswith(marker))
+        self.assertIn('Summary shortened', published)
 
     def test_credentials_are_scoped_and_not_in_clone_url(self):
         environment = bot.git_environment(self.client)
@@ -91,8 +103,8 @@ class AzureTests(unittest.TestCase):
         fingerprint = bot.hashlib.sha256(json.dumps([('example', '2.0.0')]).encode()).hexdigest()
         with patch.object(self.client, 'request', side_effect=[
             {'value': []},
-            {'value': [{'pullRequestId': 1,
-                        'description': f'<!-- flutter-bot-update:{fingerprint} -->'}]},
+            {'value': [{'pullRequestId': 1, 'description': 'truncated'}]},
+            {'description': f'<!-- flutter-bot-update:{fingerprint} -->'},
             {'value': []},
         ]) as request, patch.object(bot, 'git') as git:
             bot.publish_update(Path('unused'), self.client, update, 'base', False)

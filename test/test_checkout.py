@@ -129,6 +129,19 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(self.run_git(self.remote, 'show', f'{updated}:generated.txt'), 'original')
         self.assertEqual(self.client.request.call_args.args[1], 'POST')
 
+    def test_workspace_publishing_includes_members_and_excludes_generated_files(self):
+        member = self.checkout / 'packages/app [mobile]/pubspec.yaml'
+        member.parent.mkdir(parents=True)
+        member.write_text('name: app\n')
+        self.change_pub_files()
+        (self.checkout / 'generated.txt').write_text('generated\n')
+        self.update['files'] = ['pubspec.yaml', 'pubspec.lock', 'packages/app [mobile]/pubspec.yaml']
+        self.publish()
+        published = self.remote_branch(self.update_branch)
+        changed = self.run_git(self.remote, 'diff-tree', '--no-commit-id', '--name-only', '-r', published)
+        self.assertEqual(set(changed.splitlines()), set(self.update['files']))
+        self.assertEqual(self.run_git(self.remote, 'show', f'{published}:generated.txt'), 'original')
+
     def test_unchanged_rerun_refreshes_pr_without_duplicate_commit(self):
         self.change_pub_files()
         self.publish()
