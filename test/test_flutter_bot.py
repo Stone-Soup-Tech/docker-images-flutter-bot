@@ -18,6 +18,7 @@ class ResolutionTests(unittest.TestCase):
         self.commands = []
         self.environment = None
         client = Mock(repository='workspace/repo', token='secret', base_branch='dev')
+        client.git_auth.return_value = ('https://bitbucket.org/', 'Basic secret')
 
         self.root = root
         (root / 'pubspec.yaml').write_text('name: example\n')
@@ -118,7 +119,7 @@ dev_dependencies:
     def test_dry_run_resolves_but_never_publishes(self):
         client = Mock()
         client.branch.return_value = 'base'
-        with patch.object(bot, 'Bitbucket', return_value=client), \
+        with patch.object(bot, 'select_provider', return_value=client), \
                 patch.object(bot, 'prepare_checkout', return_value=(Path('checkout'), 'base')), \
                 patch.object(bot, 'run_updates', return_value={'dependencies': []}), \
                 patch.object(bot, 'publish_update') as publish:
@@ -135,7 +136,7 @@ dev_dependencies:
     def test_no_arguments_resolves_and_publishes(self):
         client = Mock()
         client.branch.return_value = 'base'
-        with patch.object(bot, 'Bitbucket', return_value=client), \
+        with patch.object(bot, 'select_provider', return_value=client), \
                 patch.object(bot, 'prepare_checkout', return_value=(Path('checkout'), 'base')), \
                 patch.object(bot, 'run_updates', return_value={'dependencies': []}), \
                 patch.object(bot, 'publish_update') as publish:

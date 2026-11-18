@@ -1,12 +1,30 @@
-# Flutter dependency bot for Bitbucket
+# Flutter dependency bot for Bitbucket and Azure DevOps
 
 [![Publish Flutter bot image](https://github.com/Stone-Soup-Tech/docker-images-flutter-bot/actions/workflows/publish.yml/badge.svg)](https://github.com/Stone-Soup-Tech/docker-images-flutter-bot/actions/workflows/publish.yml) [![GHCR version](https://ghcr-badge.egpl.dev/Stone-Soup-Tech/flutter-bot/latest_tag?trim=major&label=latest)](https://ghcr.io/stone-soup-tech/flutter-bot)
 
 Update `pubspec.yaml` and `pubspec.lock` to the newest compatible stable dependency
-versions and maintain one grouped Bitbucket pull request. Flutter, Python and Git
+versions and maintain one grouped pull request in Bitbucket Cloud or Azure Repos Git. Flutter, Python and Git
 are installed in the image.
 
-## Usage
+## Provider selection
+
+One image supports both platforms. Select the provider explicitly:
+
+```sh
+flutter-bot --provider bitbucket
+flutter-bot --provider azure
+```
+
+Without `--provider`, the bot detects Azure Pipelines from `TF_BUILD=true` or
+Bitbucket from `BITBUCKET_REPO_FULL_NAME`. If neither or both are detected, it
+raises an error requiring an explicit `--provider`.
+An explicit provider takes precedence over detection. Azure support currently
+targets **Azure DevOps Services** at `https://dev.azure.com/<organization>/`;
+Azure DevOps Server and legacy collection URLs are not supported.
+
+## Bitbucket Pipelines
+
+### Bitbucket Pipelines setup
 
 Image: `ghcr.io/stone-soup-tech/flutter-bot:latest`.
 Source: [Stone-Soup-Tech/docker-images-flutter-bot](https://github.com/Stone-Soup-Tech/docker-images-flutter-bot).
@@ -26,7 +44,7 @@ Use the complete [pipeline example](examples/bitbucket-pipelines.yml) for Pub
 caching, a manual dry-run toggle and a step timeout. Merge its sections into your
 existing pipeline rather than replacing unrelated steps.
 
-## Credentials and setup
+### Bitbucket credentials and setup
 
 Configure these as **secured Bitbucket repository or workspace variables**:
 
@@ -55,24 +73,7 @@ credentials and a clean local checkout; the bot falls back to the repository's d
 `BITBUCKET_BRANCH` is absent. It uses the repository's default reviewers,
 excluding the authenticated account.
 
-## Dry-run
-
-```sh
-flutter-bot --dry-run
-```
-
-Dry-run resolves dependencies in the pipeline checkout, prints the proposed update summary
-and checks existing PRs, without committing, pushing branches or creating or
-modifying PRs. It leaves the proposed changes in the local checkout. Bitbucket
-discards that checkout when the step ends; when running locally, use a disposable
-checkout if you want to preserve your working files. Credentials and network
-access are still required.
-
-Alternatively, set `FLUTTER_BOT_DRY_RUN=true`. It accepts `true` or `false` and
-defaults to `false`; `--dry-run` always enables dry-run. This is the only command
-option needed for normal use: branch, grouping and reviewers are automatic.
-
-## Scheduling and validation
+### Bitbucket scheduling and validation
 
 1. Add the pipeline and secured credentials to your repository.
 2. Run it manually on the branch you want updated, with dry-run enabled. The
@@ -89,6 +90,119 @@ The bot opens a PR; it does not merge it or verify application behavior.
 Keep a concurrency group to prevent overlapping updater runs on the same branch.
 Independent Android or pipeline-image update jobs can run in parallel. Use a tool
 such as Renovate for those dependency types; this image updates Pub dependencies.
+
+## Azure Pipelines
+
+### Azure Pipelines setup
+
+Use the same `ghcr.io/stone-soup-tech/flutter-bot:latest` image in an Ubuntu
+container job. See the complete [Azure pipeline example](examples/azure-pipelines.yml)
+for checkout, Pub caching, manual dry-run selection, and an optional schedule.
+The image must contain this provider implementation before using that example;
+changes in this repository do not update an already published image.
+
+```yaml
+pool:
+  vmImage: ubuntu-latest
+container: ghcr.io/stone-soup-tech/flutter-bot:latest
+steps:
+  - checkout: self
+    clean: true
+    persistCredentials: false
+  - bash: flutter-bot --provider azure --dry-run
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+```
+
+Map `System.AccessToken` explicitly as shown. The bot uses the pipeline job's
+Build Service identity for REST and Git access; no bot username or stored PAT is
+needed. Grant that identity **Read**, **Contribute**, **Create branch**, and
+**Contribute to pull requests** on the repository. It also needs **Force push**
+on its `flutter-bot/*` branches to refresh their history. Scope that permission
+to bot branches; policy bypass is not required. Private Azure Git dependencies
+must be accessible to the same identity, including any necessary cross-project
+job authorization. Other Git hosts require their own credentials.
+
+The bot reads `SYSTEM_COLLECTIONURI`, `SYSTEM_TEAMPROJECTID`,
+`BUILD_REPOSITORY_ID`, `BUILD_SOURCEBRANCH`, `BUILD_SOURCESDIRECTORY`, and
+`BUILD_SOURCEVERSION` from Azure's pipeline environment. Run it on an application
+branch; PR merge refs, tags, and the bot's own branches are rejected. It checks
+the clean checkout and remote base commit before publishing. Outside Pipelines,
+provide those variables and the token; omit `BUILD_SOURCEBRANCH` to use the
+repository default branch, and omit the checkout path to use the current directory.
+
+Configure automatic reviewers through Azure branch policies. The Azure provider
+does not copy Bitbucket reviewer settings or enable auto-complete. An abandoned
+Azure PR suppresses the same dependency-version set, like a declined Bitbucket PR;
+a reviewer's reject vote alone does not suppress updates. Azure source-branch
+deletion on merge follows your completion settings.
+
+Start with a manual dry-run, then disable dry-run to validate publication in a
+test repository. Enable the example's schedule only after validation. Avoid
+overlapping updater runs on the same branch; Git leases protect against concurrent
+pushes, but overlapping runs can still fail and need rerunning. Add your normal
+Azure Repos branch-policy build validation for dependency PRs.
+
+Microsoft references: [pipeline job token](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables#systemaccesstoken),
+[repository permissions](https://learn.microsoft.com/en-us/azure/devops/repos/git/set-git-repository-permissions),
+and [container job requirements](https://learn.microsoft.com/en-us/azure/devops/pipelines/process/container-phases).
+
+### Azure scheduling and validation
+
+1. Create an Azure pipeline pointing to the YAML from the
+   [Azure example](examples/azure-pipelines.yml). Run it manually on the target
+   application branch with `dryRun: true`, then with `dryRun: false` to verify PR
+   publication.
+2. Uncomment the example's top-level `schedules` block, or add this to the main
+   pipeline YAML:
+
+   ```yaml
+   schedules:
+     - cron: '0 6 * * 1'
+       displayName: Weekly Flutter dependency updates
+       branches:
+         include: [main]
+       always: true
+   ```
+
+   This runs every Monday at **06:00 UTC**. Replace `main` with the application
+   branch you want updated. Cron times use UTC and do not adjust for daylight
+   saving time. Keep `always: true` so the bot checks for newly published packages
+   even when your repository has no new commits.
+3. Change the example's `dryRun` parameter default to `false` when scheduled runs
+   should publish. Schedules use parameter defaults; selecting `false` for a
+   manual run does not change later scheduled runs. If using the minimal setup
+   above instead, remove its hardcoded `--dry-run` to enable publication.
+4. Commit the schedule to each included target branch. Each branch's YAML must
+   contain a schedule that includes that branch. Define schedules in the main
+   pipeline YAML, rather than a template.
+5. Remove any schedules configured in the pipeline settings UI, because UI
+   schedules override YAML schedules. Push the YAML change after removing them,
+   then open the pipeline's **Scheduled runs** view to check upcoming runs.
+
+The example's `trigger: none` disables commit-triggered runs; the YAML schedule
+still runs. Keep this updater pipeline separate from your application PR build
+validation. Ensure one updater run finishes before the next starts;
+`always: true` can start a scheduled run while another run is still in progress.
+
+See Microsoft's [scheduled trigger documentation](https://learn.microsoft.com/en-us/azure/devops/pipelines/process/scheduled-triggers)
+for cron syntax, branch evaluation, and schedule troubleshooting.
+
+## Dry-run
+
+```sh
+flutter-bot --dry-run
+```
+
+Dry-run resolves dependencies in the pipeline checkout, prints the proposed update summary
+and checks existing PRs, without committing, pushing branches or creating or
+modifying PRs. It leaves the proposed changes in the local checkout. The pipeline
+discards that checkout when the job ends; when running locally, use a disposable
+checkout if you want to preserve your working files. Credentials and network
+access are still required.
+
+Alternatively, set `FLUTTER_BOT_DRY_RUN=true`. It accepts `true` or `false` and
+defaults to `false`; `--dry-run` always enables dry-run. Use `--provider` to choose the platform explicitly; branch and grouping are automatic.
 
 ## What gets updated
 
@@ -134,8 +248,8 @@ with all resolved updates, using `chore(deps)` commit and PR titles.
 
 Unchanged file trees do not create duplicate commits. Declining a PR suppresses
 the same resolved dependency-version set until versions change. Runs with no
-file changes leave existing PRs open. Default reviewers are assigned when a PR
-is created.
+file changes leave existing PRs open. Bitbucket default reviewers are assigned when a PR
+is created; Azure reviewers follow branch policies.
 
 Treat update branches as bot-owned: the bot replaces their contents when
 refreshing updates. Before publishing, it checks the remote base branch again.
