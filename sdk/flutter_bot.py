@@ -17,6 +17,12 @@ from urllib.parse import quote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
+if __package__:
+    from .pub_workspace import Workspace, update_report, validate_pub_file
+else:
+    from pub_workspace import Workspace, update_report, validate_pub_file
+
+
 GIT_API_TOKEN_USERNAME = "x-bitbucket-api-token-auth"
 API_ROOT = "https://api.bitbucket.org/2.0/"
 
@@ -270,15 +276,32 @@ class Azure(Provider):
                     "searchCriteria.targetRefName": "refs/heads/" + self.base_branch,
                     "$top": 100, "$skip": skip})
                 page = self.request(f"{self.repo_path}/pullrequests?{query}")["value"]
-                result.extend({"id": pr["pullRequestId"], "state": state,
-                               "description": pr.get("description", "")} for pr in page)
+                for pr in page:
+                    # List responses truncate descriptions to 400 characters.
+                    # The suppression marker can be at the end of a long body.
+                    detail = self.request(f"{self.repo_path}/pullrequests/{pr['pullRequestId']}") if state == "DECLINED" else pr
+                    result.append({"id": pr["pullRequestId"], "state": state,
+                                   "description": detail.get("description", "")})
                 if not page:
                     break
                 skip += len(page)
         return result
 
+    @staticmethod
+    def description_for_api(description):
+        """Keep the suppression marker while fitting Azure's 4000-character limit."""
+        if len(description.encode("utf-16-le")) // 2 <= 4000:
+            return description
+        marker = re.search(r"\n\n<!-- flutter-bot-update:[a-f0-9]{64} -->$", description)
+        suffix = "\n\nSummary shortened; see file changes and pipeline logs for the full update."
+        if marker:
+            suffix += marker.group()
+        budget = 4000 - len(suffix.encode("utf-16-le")) // 2
+        prefix = description.encode("utf-16-le")[:budget * 2].decode("utf-16-le", errors="ignore")
+        return prefix.rsplit("\n", 1)[0] + suffix
+
     def save_pull_request(self, opened, update_branch, title, description):
-        payload = {"title": title, "description": description}
+        payload = {"title": title, "description": self.description_for_api(description)}
         path = f"{self.repo_path}/pullrequests"
         if opened:
             path += f"/{opened['id']}"
@@ -377,13 +400,23 @@ def publish_update(checkout, client, update, base_sha, dry_run):
         raise RuntimeError("Checkout commit changed during resolution; rerun the pipeline")
     if git(checkout, "diff", "--cached", "--name-only"):
         raise RuntimeError("Unexpected staged files; refusing to publish")
-    git(checkout, "add", "--", "pubspec.yaml", "pubspec.lock")
-    staged = git(checkout, "diff", "--cached", "--name-only").splitlines()
+    allowed = set(update.get("files", ("pubspec.yaml", "pubspec.lock")))
+    if not allowed or "pubspec.yaml" not in allowed or "pubspec.lock" not in allowed:
+        raise ValueError("Update must include the root Pub files")
+    for name in allowed:
+        path = checkout / name
+        if (Path(name).is_absolute() or ".." in Path(name).parts
+                or path.name not in ("pubspec.yaml", "pubspec.lock")
+                or (path.name == "pubspec.lock" and name != "pubspec.lock")):
+            raise ValueError("Invalid Pub file in update")
+        validate_pub_file(checkout.resolve(), path)
+    git(checkout, "--literal-pathspecs", "add", "--", *sorted(allowed))
+    staged = [name for name in git(checkout, "diff", "--cached", "--name-only", "-z").split("\0") if name]
     if not staged:
         print("No file changes to publish.")
         return
-    if set(staged) - {"pubspec.yaml", "pubspec.lock"}:
-        raise RuntimeError("Only root Pub files may be published")
+    if set(staged) - allowed:
+        raise RuntimeError("Only discovered workspace Pub files may be published")
 
     tree = git(checkout, "write-tree")
     unchanged = False
@@ -419,124 +452,45 @@ def git_environment(client):
     return environment
 
 
-def pub(checkout, environment, *arguments, capture=False):
+def pub(checkout, environment, *arguments, capture=False, tool="flutter"):
     started = time.monotonic()
-    print("Running flutter pub " + " ".join(arguments), flush=True)
-    result = subprocess.run(["flutter", "pub", *arguments], cwd=checkout,
+    print(f"Running {tool} pub " + " ".join(arguments), flush=True)
+    result = subprocess.run([tool, "pub", *arguments], cwd=checkout,
                             env=environment, text=True, check=True,
                             stdout=subprocess.PIPE if capture else None)
     print(f"Finished in {time.monotonic() - started:.1f}s", flush=True)
     return result.stdout if capture else None
 
 
-def lockfile_versions(content):
-    """Read package versions from Pub's generated lockfile format."""
-    if content is None:
-        return {}
-    versions = {}
-    package = None
-    for line in content.decode().splitlines():
-        match = re.fullmatch(r"  ([A-Za-z0-9_]+):", line)
-        if match:
-            package = match[1]
-        elif package and line.startswith("    version: "):
-            versions[package] = line.split(": ", 1)[1].strip("\"'")
-    return versions
-
-
-def pubspec_constraints(content):
-    """Read simple version constraints; leave complex YAML declarations unresolved."""
-    constraints = {}
-    section = None
-    package = None
-    for line in content.decode().splitlines():
-        if line and not line[0].isspace() and not line.startswith('#'):
-            section = line.split(':', 1)[0]
-            package = None
-        if section not in ('dependencies', 'dev_dependencies'):
-            continue
-        match = re.fullmatch(r"  ([A-Za-z0-9_]+):\s*(.*)", line)
-        if match:
-            package, value = match.groups()
-        else:
-            match = re.fullmatch(r"    version:\s*(.*)", line)
-            if not match or not package:
-                continue
-            value = match[1]
-        # Only use constraints whose syntax is unambiguous without a YAML parser.
-        match = re.fullmatch(r"[\"']?(\^?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?)[\"']?\s*(?:#.*)?", value)
-        if match:
-            constraints[package] = match[1]
-    return constraints
-
-
 def run_updates(checkout, client, base_sha):
-    """Resolve dependencies directly in the pipeline's disposable checkout."""
+    """Resolve the entire Pub workspace once, in the disposable checkout."""
+    checkout = checkout.resolve()
     environment = git_environment(client)
-    project = checkout
-    paths = [project / name for name in ("pubspec.yaml", "pubspec.lock")]
-    for path in paths:
-        if path.is_symlink() or not path.resolve().is_relative_to(checkout.resolve()):
-            raise ValueError("Pub files must not be symlinks or escape the checkout")
-    if not paths[0].is_file():
+    validate_pub_file(checkout, checkout / "pubspec.yaml")
+    validate_pub_file(checkout, checkout / "pubspec.lock")
+    if not (checkout / "pubspec.yaml").is_file():
         raise ValueError("No pubspec.yaml in the selected directory")
-    original = [path.read_bytes() if path.exists() else None for path in paths]
-    # Pub selects stable releases unless a package already uses a prerelease.
-    # Enforce stable versions for direct dependencies, including dev dependencies.
-    # Transitive prereleases are controlled by the packages that require them.
-    pub(project, environment, "upgrade", "--major-versions", "--no-precompile", "--no-example")
-    pub(project, environment, "upgrade", "--tighten", "--no-precompile", "--no-example")
-    allowed = {str(path.relative_to(checkout)) for path in paths}
-    changed_paths = git(checkout, "diff", "--name-only").splitlines()
-    if any(Path(name).name in ("pubspec.yaml", "pubspec.lock") and name not in allowed
-           for name in changed_paths):
-        raise RuntimeError("Multi-package Pub workspaces are unsupported; other Pub files changed")
-    report = json.loads(pub(project, environment, "outdated", "--json", "--no-prereleases", "--show-all", capture=True))
-    packages = report["packages"]
-    prereleases = [p["package"] for p in packages
-                   if p.get("kind") in ("direct", "dev") and p.get("current")
-                   and "-" in p["current"]["version"].split("+", 1)[0]]
-    if prereleases:
-        raise RuntimeError("Stable-only policy: direct dependencies contain prereleases: " + ", ".join(prereleases))
-    updated = [path.read_bytes() for path in paths]
+    try:
+        listing = json.loads(pub(checkout, environment, "workspace", "list", "--json",
+                                 capture=True, tool="dart"))
+    except subprocess.CalledProcessError:
+        raise RuntimeError("Cannot list Pub workspace packages; use Dart 3.13+ and a valid root pubspec.yaml") from None
+    workspace = Workspace.from_report(checkout, listing)
+    original = workspace.snapshot()
+    # Both commands operate on the shared resolution and every member manifest.
+    pub(checkout, environment, "upgrade", "--major-versions", "--no-precompile", "--no-example")
+    pub(checkout, environment, "upgrade", "--tighten", "--no-precompile", "--no-example")
+    changed = git(checkout, "diff", "--name-only", "-z").split("\0")
+    untracked = git(checkout, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    workspace.validate_changes(name for name in (*changed, *untracked) if name)
+    report = json.loads(pub(checkout, environment, "outdated", "--json", "--no-prereleases",
+                            "--show-all", capture=True))
+    updated = workspace.snapshot()
+    update = update_report(workspace, original, updated, report["packages"])
     if original == updated:
         return None
-    previous_versions = lockfile_versions(original[1])
-    previous_constraints = pubspec_constraints(original[0])
-    updated_constraints = pubspec_constraints(updated[0])
-    rows = []
-    held_back = []
-    dependencies = []
-    for package in packages:
-        package_link = f"[{package['package']}](https://pub.dev/packages/{package['package']})"
-        dependency_type = {
-            "direct": "dependencies", "dev": "dev_dependencies",
-            "transitive": "transitive", "transitive dev": "transitive (dev_dependencies)",
-        }.get(package.get("kind"), "unknown")
-        current = (package.get("current") or {}).get("version")
-        if current:
-            dependencies.append({"name": package["package"], "version": current})
-        latest = (package.get("latest") or {}).get("version")
-        if current and latest and current != latest:
-            held_back.append(f"| {package_link} | {dependency_type} | `{current}` | `{latest}` |")
-        previous = previous_versions.get(package["package"])
-        if package.get("kind") in ("direct", "dev") and current and (current != previous or previous_constraints.get(package["package"])
-                                             != updated_constraints.get(package["package"])):
-            previous_constraint = previous_constraints.get(package["package"], previous)
-            updated_constraint = updated_constraints.get(package["package"], current)
-            previous_display = f"`{previous_constraint}`" if previous_constraint else "Not locked"
-            rows.append(f"| {package_link} | {dependency_type} | {previous_display} | `{updated_constraint}` |")
-    body = "Updates direct dependency constraints to the newest mutually compatible stable versions and refreshes the lockfile."
-    body += "\n\nFlutter SDK pins and package compatibility constraints remain in effect."
-    if rows:
-        body += "\n\nUpdated direct dependencies (including dev dependencies):\n\n| Package | Type | Previous | Updated |\n| --- | --- | --- | --- |\n" + "\n".join(rows)
-    else:
-        body += "\n\nRefreshed dependency constraints or transitive dependencies; direct dependency versions are unchanged."
-    if held_back:
-        body += "\n\nVersions held back by compatibility constraints:\n\n| Package | Type | Resolved | Latest stable |\n| --- | --- | --- | --- |\n" + "\n".join(held_back)
-    print(body, flush=True)
-    return {"dependencies": dependencies, "pr-title": "chore(deps): update Flutter dependencies",
-            "commit-message": "chore(deps): update Flutter dependencies", "pr-body": body}
+    print(update["pr-body"], flush=True)
+    return update
 
 
 def main(argv=None):

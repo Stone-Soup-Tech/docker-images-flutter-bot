@@ -7,7 +7,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/flutter-bot
-COPY sdk/flutter_bot.py ./flutter_bot.py
+COPY sdk/flutter_bot.py sdk/pub_workspace.py ./
 RUN printf '#!/bin/sh\nexec python3 -B /opt/flutter-bot/flutter_bot.py "$@"\n' > /usr/local/bin/flutter-bot \
     && chmod 755 /usr/local/bin/flutter-bot
 ENV PYTHONDONTWRITEBYTECODE=1 \

@@ -38,3 +38,8 @@ jobs:
             test -s pubspec.lock
             flutter pub outdated --json --no-prereleases --show-all
           '
+      - name: Smoke test native Pub workspace updates
+        run: >-
+          docker run --rm -v "$PWD:/workspace:ro" -w /workspace
+          flutter-bot:test python3 -B -m unittest discover
+          -s test -p integration_workspace.py
