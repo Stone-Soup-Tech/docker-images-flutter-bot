@@ -59,6 +59,127 @@ class AzureTests(unittest.TestCase):
             self.assertEqual(request.call_args.args[1], 'PATCH')
             self.assertEqual(request.call_args.args[2], {'title': 'title', 'description': 'body'})
 
+    def identity(self, identifier, email, **extra):
+        return {"id": identifier, "isActive": True,
+                "properties": {"Mail": {"$value": email}}, **extra}
+
+    def test_reviewer_emails_resolve_exactly_and_deduplicate_with_ids(self):
+        identifier = '11111111-2222-3333-4444-555555555555'
+        other = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        with patch.object(self.client, 'request', return_value={'value': [
+                self.identity(identifier, 'YOU@example.com'),
+                self.identity(other, 'you-other@example.com'),
+        ]}) as request:
+            self.client.configure_reviewers([' you@example.com ', 'YOU@example.com', identifier, other.upper()])
+        self.assertEqual(self.client.reviewer_ids, (identifier, other))
+        request.assert_called_once()
+        self.assertTrue(request.call_args.kwargs['identities'])
+        query = parse_qs(urlparse(request.call_args.args[0]).query)
+        self.assertEqual(query['filterValue'], ['you@example.com'])
+
+    def test_reviewer_ids_skip_identity_lookup(self):
+        identifier = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        with patch.object(self.client, 'request') as request:
+            self.client.configure_reviewers([identifier.upper(), identifier])
+        request.assert_not_called()
+        self.assertEqual(self.client.reviewer_ids, (identifier,))
+
+    def test_missing_ambiguous_and_inactive_reviewers_are_rejected(self):
+        first = '11111111-2222-3333-4444-555555555555'
+        second = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        email = 'you@example.com'
+        for identities in ([], [self.identity(first, 'other@example.com')],
+                           [self.identity(first, email), self.identity(second, email)],
+                           [self.identity(first, email, isActive=False)]):
+            with self.subTest(identities=identities), \
+                    patch.object(self.client, 'request', return_value={'value': identities}):
+                with self.assertRaisesRegex(ValueError, 'Expected one active Azure identity'):
+                    self.client.configure_reviewers([email])
+
+    def test_display_names_and_invalid_inputs_are_rejected(self):
+        with patch.object(self.client, 'request') as request:
+            for reviewer in ('Jane Smith', '', 'not-an-id', 'you @example.com'):
+                with self.subTest(reviewer=reviewer), self.assertRaisesRegex(ValueError, 'email address or'):
+                    self.client.configure_reviewers([reviewer])
+            request.assert_not_called()
+
+    def test_identity_permission_error_explains_guid_fallback(self):
+        with patch.object(self.client, 'request', side_effect=RuntimeError('HTTP 403')):
+            with self.assertRaisesRegex(RuntimeError, 'identity GUID to skip lookup.*HTTP 403'):
+                self.client.configure_reviewers(['you@example.com'])
+
+    def test_create_includes_explicit_reviewers(self):
+        identifier = '11111111-2222-3333-4444-555555555555'
+        self.client.configure_reviewers([identifier])
+        with patch.object(self.client, 'request', return_value={'pullRequestId': 5}) as request:
+            self.client.save_pull_request(None, 'branch', 'title', 'body')
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args[2]['reviewers'], [{'id': identifier}])
+
+    def test_refresh_adds_only_missing_reviewers_without_votes_or_required_flags(self):
+        first = '11111111-2222-3333-4444-555555555555'
+        second = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        self.client.configure_reviewers([first, second])
+        with patch.object(self.client, 'request', side_effect=[
+            {'pullRequestId': 5},
+            {'value': [{'id': first, 'vote': 10, 'isRequired': True}, {'id': 'policy-reviewer'}]},
+            [],
+        ]) as request:
+            self.client.save_pull_request({'id': 5}, 'branch', 'title', 'body')
+        self.assertNotIn('reviewers', request.call_args_list[0].args[2])
+        self.assertEqual(request.call_args.args,
+                         (f'{self.client.repo_path}/pullrequests/5/reviewers', 'POST', [{'id': second}]))
+
+    def test_refresh_does_not_readd_existing_reviewers(self):
+        identifier = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        self.client.configure_reviewers([identifier])
+        with patch.object(self.client, 'request', side_effect=[
+            {'pullRequestId': 5}, {'value': [{'id': identifier.upper(), 'vote': 10}]},
+        ]) as request:
+            self.client.save_pull_request({'id': 5}, 'branch', 'title', 'body')
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(len(request.call_args.args), 1)
+
+    def test_identity_api_request_is_scoped_to_organization(self):
+        response = Mock()
+        response.headers = {}
+        response.read.return_value = b'{"value": []}'
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch.object(bot, 'urlopen', return_value=response) as open_request:
+            self.client.request('_apis/identities?filterValue=you%40example.com', identities=True)
+        request = open_request.call_args.args[0]
+        self.assertEqual(urlparse(request.full_url).netloc, 'vssps.dev.azure.com')
+        self.assertEqual(urlparse(request.full_url).path, '/example/_apis/identities')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer azure-secret')
+        with patch.object(bot, 'urlopen') as request:
+            with self.assertRaises(ValueError):
+                self.client.request('https://evil.test/identities', identities=True)
+            request.assert_not_called()
+
+    def test_reviewer_dry_run_resolves_but_never_assigns(self):
+        identifier = '11111111-2222-3333-4444-555555555555'
+        with patch.object(bot, 'select_provider', return_value=self.client), \
+                patch.object(bot, 'prepare_checkout', return_value=(Path('unused'), 'base')), \
+                patch.object(bot, 'run_updates', return_value={'dependencies': []}), \
+                patch.object(self.client, 'pull_requests', return_value=[]), \
+                patch.object(self.client, 'request', return_value={
+                    'value': [self.identity(identifier, 'you@example.com')]}) as request:
+            bot.main(['--provider', 'azure', '--reviewer', 'you@example.com',
+                      '--reviewer', identifier, '--dry-run'])
+        self.assertEqual(self.client.reviewer_ids, (identifier,))
+        request.assert_called_once()
+        self.assertTrue(request.call_args.kwargs['identities'])
+
+    def test_reviewer_resolution_fails_before_checkout_or_dependency_changes(self):
+        with patch.object(bot, 'select_provider', return_value=self.client), \
+                patch.object(bot, 'prepare_checkout') as checkout, \
+                patch.object(bot, 'run_updates') as update:
+            with self.assertRaisesRegex(ValueError, 'display names are unsupported'):
+                bot.main(['--reviewer', 'Jane Smith'])
+        checkout.assert_not_called()
+        update.assert_not_called()
+
     def test_long_description_keeps_marker_and_fits_azure_limit(self):
         marker = '<!-- flutter-bot-update:' + 'a' * 64 + ' -->'
         description = ('A long dependency row 😀\n' * 300) + '\n\n' + marker

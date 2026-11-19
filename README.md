@@ -22,6 +22,14 @@ An explicit provider takes precedence over detection. Azure support currently
 targets **Azure DevOps Services** at `https://dev.azure.com/<organization>/`;
 Azure DevOps Server and legacy collection URLs are not supported.
 
+Both providers accept repeatable `--reviewer IDENTIFIER` arguments through the
+same interface. Identifier formats depend on the provider:
+
+| Provider | Reviewer identifiers |
+| --- | --- |
+| Azure DevOps | Email address or Azure DevOps identity GUID. |
+| Bitbucket Cloud | Bitbucket UUID or Atlassian account ID. |
+
 ## Bitbucket Pipelines
 
 ### Bitbucket Pipelines setup
@@ -70,8 +78,34 @@ and checks that the target branch still points to the same commit.
 The target branch comes from `BITBUCKET_BRANCH`: running the pipeline on `dev`
 updates `dev`. Outside Pipelines, provide `BITBUCKET_REPO_FULL_NAME` and the
 credentials and a clean local checkout; the bot falls back to the repository's default branch when
-`BITBUCKET_BRANCH` is absent. It uses the repository's default reviewers,
-excluding the authenticated account.
+`BITBUCKET_BRANCH` is absent. By default, it uses the repository's default reviewers,
+excluding the authenticated account. Use `--reviewer` to select reviewers explicitly.
+
+### Explicit Bitbucket reviewers
+
+Use the same repeatable `--reviewer` option with a **Bitbucket UUID** or
+**Atlassian account ID**:
+
+```sh
+flutter-bot --provider bitbucket --reviewer '{11111111-2222-3333-4444-555555555555}' --reviewer '557058:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+```
+
+UUIDs are accepted with or without braces. The bot resolves identifiers through
+Bitbucket's user API before dependency updates, normalizes them to UUIDs, and
+ignores duplicates. The API token needs user-read access, and selected reviewers
+must have repository access. The publishing account cannot review its own PR.
+
+Bitbucket Cloud does not provide reliable public lookup of other users by email.
+Email addresses, nicknames, and display names are therefore rejected; use the
+`uuid` or `account_id` from an existing PR's reviewers or the user API instead.
+See Atlassian's [user identity changes](https://developer.atlassian.com/cloud/bitbucket/bitbucket-api-changes-gdpr/)
+and [user API](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-users/).
+
+On creation, explicit reviewers replace the bot's selection of repository default
+reviewers. Without this option, existing default-reviewer behavior is retained.
+When refreshing a PR, missing explicit reviewers are added while all existing
+reviewers are retained. The bot does not send approval or vote changes. Dry-run
+resolves identities but does not assign reviewers or modify PRs.
 
 ### Bitbucket scheduling and validation
 
@@ -131,11 +165,12 @@ the clean checkout and remote base commit before publishing. Outside Pipelines,
 provide those variables and the token; omit `BUILD_SOURCEBRANCH` to use the
 repository default branch, and omit the checkout path to use the current directory.
 
-Configure automatic reviewers through Azure branch policies. The Azure provider
-does not copy Bitbucket reviewer settings or enable auto-complete. An abandoned
-Azure PR suppresses the same dependency-version set, like a declined Bitbucket PR;
-a reviewer's reject vote alone does not suppress updates. Azure source-branch
-deletion on merge follows your completion settings.
+Configure automatic reviewers through Azure branch policies, or use explicit
+reviewers as described below. The Azure provider does not copy Bitbucket reviewer
+settings or enable auto-complete. An abandoned Azure PR suppresses the same
+dependency-version set, like a declined Bitbucket PR; a reviewer's reject vote
+alone does not suppress updates. Azure source-branch deletion on merge follows
+your completion settings.
 
 Start with a manual dry-run, then disable dry-run to validate publication in a
 test repository. Enable the example's schedule only after validation. Avoid
@@ -146,6 +181,54 @@ Azure Repos branch-policy build validation for dependency PRs.
 Microsoft references: [pipeline job token](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables#systemaccesstoken),
 [repository permissions](https://learn.microsoft.com/en-us/azure/devops/repos/git/set-git-repository-permissions),
 and [container job requirements](https://learn.microsoft.com/en-us/azure/devops/pipelines/process/container-phases).
+
+### Explicit Azure reviewers
+
+Use repeatable `--reviewer` arguments to add people directly to Flutter Bot PRs
+without changing organization or branch policies:
+
+```sh
+flutter-bot --provider azure --reviewer you@company.com --reviewer colleague@company.com
+```
+
+In your existing Azure pipeline step:
+
+```yaml
+- bash: flutter-bot --provider azure --reviewer you@company.com
+  displayName: Run Flutter Bot
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    FLUTTER_BOT_DRY_RUN: ${{ lower(parameters.dryRun) }}
+```
+
+Each argument accepts an email address or an **Azure DevOps identity GUID**.
+Display names are unsupported because they can be ambiguous. Emails are resolved
+case-insensitively against active identities with an exact mail or account match;
+unknown or ambiguous emails fail before dependency updates or publishing. Duplicate
+reviewers are ignored. Reviewers must already have access to the project.
+
+Email lookup uses the organization's Azure Identities API and requires identity
+read access for the job token. If your organization restricts that API, supply the
+Azure DevOps identity GUID instead to skip lookup:
+
+```sh
+flutter-bot --provider azure --reviewer 11111111-2222-3333-4444-555555555555
+```
+
+Use the Azure DevOps identity `id` (for example, from an existing PR's reviewer
+list), not the Microsoft Entra object ID. The pipeline identity still needs
+permission to add PR reviewers. This option requests reviewers; it does not make
+their approval mandatory or change branch policies.
+
+Configured reviewers are included when creating a PR and added if missing when
+refreshing an existing one. Existing reviewers, required-reviewer settings, and
+votes are preserved. With no `--reviewer` arguments, only Azure's normal reviewer
+policies apply. Dry-run resolves emails but does not create PRs or assign reviewers.
+Bitbucket supports the same option with UUIDs or Atlassian account IDs, as
+described in the Bitbucket section above.
+
+References: [Azure identity lookup](https://learn.microsoft.com/en-us/rest/api/azure/devops/ims/identities/read-identities?view=azure-devops-rest-7.1)
+and [adding PR reviewers](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-request-reviewers/create-pull-request-reviewers?view=azure-devops-rest-7.1).
 
 ### Azure scheduling and validation
 
@@ -303,8 +386,9 @@ with all resolved updates, using `chore(deps)` commit and PR titles.
 
 Unchanged file trees do not create duplicate commits. Declining a PR suppresses
 the same resolved dependency-version set until versions change. Runs with no
-file changes leave existing PRs open. Bitbucket default reviewers are assigned when a PR
-is created; Azure reviewers follow branch policies.
+file changes leave existing PRs open. Bitbucket uses explicit reviewers when
+configured, otherwise repository defaults on creation. Azure reviewers follow
+branch policies and any explicit `--reviewer` selections.
 Azure summaries that exceed its API description limit are shortened, preserving
 the update marker; full details remain in pipeline logs and the file diff.
 

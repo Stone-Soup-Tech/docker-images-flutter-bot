@@ -17,6 +17,8 @@ pipelines:
             - flutter-bot-pub
           script:
             - export FLUTTER_BOT_DRY_RUN="$DRY_RUN"
+            # Optional: append --reviewer '{BITBUCKET-USER-UUID}'.
+            # Atlassian account IDs are also accepted; repeat for more reviewers.
             - flutter-bot
 # No Docker service required. Add this step alongside Android/Renovate in a
 # parallel block. Add flutter-bot/* to the consumer's branch validation rules.

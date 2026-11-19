@@ -135,7 +135,7 @@ dev_dependencies:
         self.assertTrue(publish.call_args.args[4])
 
     def test_removed_options_are_rejected(self):
-        for option in ('--base-branch', '--group', '--reviewer', '--directory'):
+        for option in ('--base-branch', '--group', '--directory'):
             with self.subTest(option=option), patch.object(bot, 'Bitbucket') as client:
                 with self.assertRaises(SystemExit):
                     bot.main([option, 'unused'])

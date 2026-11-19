@@ -35,6 +35,8 @@ jobs:
           restoreKeys: |
             flutter-bot-pub | "$(Agent.OS)"
           path: /opt/pub-cache
+      # Optional: append --reviewer you@company.com to request a reviewer.
+      # Repeat --reviewer for more people; identity GUIDs skip email lookup.
       - bash: flutter-bot --provider azure
         displayName: Update Flutter dependencies
         env:

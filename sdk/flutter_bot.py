@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+from uuid import UUID
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -62,6 +63,28 @@ class Provider(ABC):
     def repository_url(self):
         """Credential-free HTTPS clone URL."""
 
+    def __init__(self):
+        self.reviewer_ids = ()
+
+    def configure_reviewers(self, reviewers):
+        """Normalize and resolve explicit reviewers before any publishing writes."""
+        resolved = []
+        seen = set()
+        for reviewer in reviewers:
+            reviewer = reviewer.strip()
+            key = reviewer.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            reviewer_id = self.resolve_reviewer(reviewer)
+            if reviewer_id not in resolved:
+                resolved.append(reviewer_id)
+        self.reviewer_ids = tuple(resolved)
+
+    @abstractmethod
+    def resolve_reviewer(self, reviewer):
+        """Resolve a platform-specific identifier to its canonical reviewer ID."""
+
     def validate_branch(self):
         if not self.base_branch:
             raise ValueError("Repository has no default branch")
@@ -78,6 +101,7 @@ class Bitbucket(Provider):
     commit_variable = "BITBUCKET_COMMIT"
 
     def __init__(self, base_branch=None):
+        super().__init__()
         self.base_branch = base_branch
         self.repository = os.environ["BITBUCKET_REPO_FULL_NAME"]
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository):
@@ -158,9 +182,35 @@ class Bitbucket(Provider):
         }, doseq=True)
         return list(self.values(f"{self.repo_path}/pullrequests?{query}"))
 
+    def current_user_id(self):
+        if not hasattr(self, "_current_user_id"):
+            self._current_user_id = self.request("user")["uuid"]
+        return self._current_user_id
+
+    def resolve_reviewer(self, reviewer):
+        try:
+            selected_user = "{" + str(UUID(reviewer)) + "}"
+        except ValueError:
+            # Atlassian account IDs are either legacy 24-digit hex IDs or a
+            # tenant prefix followed by a UUID. Nicknames are not unique IDs.
+            if not re.fullmatch(r"(?:[0-9a-fA-F]{24}|[0-9]+:[0-9a-fA-F-]{36})", reviewer):
+                raise ValueError(
+                    "Bitbucket --reviewer requires a Bitbucket UUID or Atlassian account ID; "
+                    "email lookup and display names are unsupported."
+                ) from None
+            selected_user = reviewer
+        try:
+            user = self.request("users/" + quote(selected_user, safe=""))
+        except RuntimeError as error:
+            raise RuntimeError("Cannot resolve Bitbucket reviewer; check the UUID/account ID and user-read access. " + str(error)) from None
+        reviewer_id = "{" + str(UUID(user["uuid"])) + "}"
+        if reviewer_id.casefold() == self.current_user_id().casefold():
+            raise ValueError("The Bitbucket publishing account cannot review its own pull request")
+        return reviewer_id
+
     def reviewers(self):
         """Use repository default reviewers, excluding the authenticated account."""
-        current_user = self.request("user")["uuid"]
+        current_user = self.current_user_id()
         candidates = self.values(f"{self.repo_path}/default-reviewers?pagelen=100")
         return [{"uuid": user["uuid"]} for user in candidates
                 if user["uuid"] != current_user]
@@ -176,11 +226,24 @@ class Bitbucket(Provider):
     def save_pull_request(self, opened, update_branch, title, description):
         payload = {"title": title, "description": description}
         if opened:
-            result = self.request(f"{self.repo_path}/pullrequests/{opened['id']}", "PUT", payload)
+            path = f"{self.repo_path}/pullrequests/{opened['id']}"
+            if self.reviewer_ids:
+                # Bitbucket replaces the reviewer list on PUT: retain every
+                # existing reviewer and send only identity fields, never votes.
+                existing = self.request(path)["reviewers"]
+                current_ids = {reviewer["uuid"].casefold() for reviewer in existing}
+                missing = [reviewer_id for reviewer_id in self.reviewer_ids
+                           if reviewer_id.casefold() not in current_ids]
+                if missing:
+                    payload["reviewers"] = ([{"uuid": reviewer["uuid"]} for reviewer in existing]
+                                            + [{"uuid": reviewer_id} for reviewer_id in missing])
+            result = self.request(path, "PUT", payload)
         else:
             payload.update({"source": {"branch": {"name": update_branch}},
                             "destination": {"branch": {"name": self.base_branch}},
-                            "close_source_branch": True, "reviewers": self.reviewers()})
+                            "close_source_branch": True,
+                            "reviewers": ([{"uuid": reviewer_id} for reviewer_id in self.reviewer_ids]
+                                          if self.reviewer_ids else self.reviewers())})
             result = self.request(f"{self.repo_path}/pullrequests", "POST", payload)
         return result["links"]["html"]["href"]
 
@@ -193,6 +256,7 @@ class Azure(Provider):
     commit_variable = "BUILD_SOURCEVERSION"
 
     def __init__(self):
+        super().__init__()
         collection = os.environ["SYSTEM_COLLECTIONURI"]
         # Constrain both REST and Git credentials to a single cloud organization.
         if not re.fullmatch(r"https://dev\.azure\.com/[A-Za-z0-9_-]+/?", collection):
@@ -221,11 +285,16 @@ class Azure(Provider):
     def git_auth(self):
         return self.collection, self.authorization
 
-    def request(self, path, method="GET", data=None):
+    def request(self, path, method="GET", data=None, *, identities=False):
         # Paths are generated internally; never accept a remote pagination URL.
         if path.startswith("/") or ":" in path or ".." in path.split("/"):
             raise ValueError("Unexpected Azure API path")
-        url = self.collection + path + ("&" if "?" in path else "?") + "api-version=7.1"
+        # Identity lookup uses Azure's dedicated host, scoped to this same
+        # validated organization. Callers cannot supply arbitrary host URLs.
+        api_root = self.collection
+        if identities:
+            api_root = api_root.replace("https://dev.azure.com/", "https://vssps.dev.azure.com/", 1)
+        url = api_root + path + ("&" if "?" in path else "?") + "api-version=7.1"
         request = Request(url, data=json.dumps(data).encode() if data is not None else None,
                           method=method, headers={"Authorization": self.authorization,
                           "Content-Type": "application/json", "Accept": "application/json"})
@@ -251,6 +320,52 @@ class Azure(Provider):
             else:
                 detail = ""
             raise RuntimeError(f"Azure {method} request failed: HTTP {error.code}{detail}") from None
+
+    def resolve_reviewer(self, reviewer):
+        try:
+            return str(UUID(reviewer))
+        except ValueError:
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+", reviewer):
+                raise ValueError("Azure --reviewer must be an email address or identity GUID; display names are unsupported") from None
+            return self.reviewer_id_for_email(reviewer)
+
+    def reviewer_id_for_email(self, email):
+        query = urlencode({"searchFilter": "General", "filterValue": email,
+                           "queryMembership": "None"})
+        try:
+            identities = self.request(f"_apis/identities?{query}", identities=True)["value"]
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Cannot resolve Azure reviewer email; identity lookup access is required. "
+                "Use --reviewer with an Azure DevOps identity GUID to skip lookup. " + str(error)
+            ) from None
+        matches = set()
+        for identity in identities:
+            if not identity.get("isActive", False):
+                continue
+            properties = identity.get("properties", {})
+            addresses = [properties.get(name, {}).get("$value", "")
+                         for name in ("Mail", "Account")]
+            if any(isinstance(value, str) and value.casefold() == email.casefold()
+                   for value in addresses):
+                matches.add(str(UUID(identity["id"])))
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected one active Azure identity matching reviewer {email!r}; found {len(matches)}. "
+                "Use an Azure DevOps identity GUID if the email is unknown or ambiguous."
+            )
+        return matches.pop()
+
+    def add_missing_reviewers(self, pull_request_id):
+        """Preserve existing reviewers, required flags, and votes on reruns."""
+        if not self.reviewer_ids:
+            return
+        path = f"{self.repo_path}/pullrequests/{pull_request_id}/reviewers"
+        existing = {reviewer["id"].casefold() for reviewer in self.request(path)["value"]}
+        missing = [{"id": reviewer_id} for reviewer_id in self.reviewer_ids
+                   if reviewer_id not in existing]
+        if missing:
+            self.request(path, "POST", missing)
 
     def branch(self, name):
         continuation = None
@@ -308,7 +423,11 @@ class Azure(Provider):
         else:
             payload.update({"sourceRefName": "refs/heads/" + update_branch,
                             "targetRefName": "refs/heads/" + self.base_branch})
+            if self.reviewer_ids:
+                payload["reviewers"] = [{"id": reviewer_id} for reviewer_id in self.reviewer_ids]
         result = self.request(path, "PATCH" if opened else "POST", payload)
+        if opened:
+            self.add_missing_reviewers(result["pullRequestId"])
         return self.repository_url + "/pullrequest/" + str(result["pullRequestId"])
 
 
@@ -498,11 +617,15 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--provider", choices=("bitbucket", "azure"),
                         help="Git hosting provider (required when no pipeline provider is detected)")
+    parser.add_argument("--reviewer", action="append", default=[], metavar="IDENTIFIER",
+                        help="Reviewer identifier: Azure email/GUID or Bitbucket UUID/account ID; repeat for multiple reviewers")
     arguments = parser.parse_args(argv)
     dry_run = os.environ.get("FLUTTER_BOT_DRY_RUN", "false")
     if dry_run not in ("true", "false"):
         parser.error("FLUTTER_BOT_DRY_RUN must be true or false")
     client = select_provider(arguments.provider)
+    if arguments.reviewer:
+        client.configure_reviewers(arguments.reviewer)
     checkout, base_sha = prepare_checkout(client)
     update = run_updates(checkout, client, base_sha)
     if update:
