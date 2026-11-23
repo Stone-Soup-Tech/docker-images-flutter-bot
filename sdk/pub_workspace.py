@@ -134,6 +134,7 @@ def update_report(workspace, before, after, packages):
     resolved = {package['package']: package for package in packages}
     local_names = {package.name for package in workspace.packages}
     rows = []
+    owners = {}
     direct_names = {package['package'] for package in packages if package.get('kind') in ('direct', 'dev')}
     multiple = len(workspace.packages) > 1
     for member in workspace.packages:
@@ -143,6 +144,7 @@ def update_report(workspace, before, after, packages):
         for (kind, name), constraint in updated.items():
             if name in local_names:
                 continue
+            owners.setdefault(name, []).append((manifest, kind))
             direct_names.add(name)
             current = current_versions.get(name) or (resolved.get(name, {}).get('current') or {}).get('version')
             old = previous_versions.get(name)
@@ -171,7 +173,12 @@ def update_report(workspace, before, after, packages):
         kind = {'direct': 'dependencies', 'dev': 'dev_dependencies',
                 'transitive': 'transitive', 'transitive dev': 'transitive (dev_dependencies)'}.get(package.get('kind'), 'unknown')
         if current and latest and current != latest:
-            held_back.append(f"| [{name}](https://pub.dev/packages/{name}) | {kind} | `{current}` | `{latest}` |")
+            declarations = owners.get(name, [(None, kind)]) if multiple else [(None, kind)]
+            for manifest, declaration_kind in declarations:
+                owner = f" `{manifest}` |" if manifest else ' — |'
+                if not multiple:
+                    owner = ''
+                held_back.append(f"|{owner} [{name}](https://pub.dev/packages/{name}) | {declaration_kind} | `{current}` | `{latest}` |")
     body = 'Updates direct dependency constraints to the newest mutually compatible stable versions and refreshes the lockfile.'
     body += '\n\nFlutter SDK pins and package compatibility constraints remain in effect.'
     if multiple:
@@ -185,8 +192,11 @@ def update_report(workspace, before, after, packages):
     else:
         body += '\n\nRefreshed dependency constraints or transitive dependencies; direct dependency versions are unchanged.'
     if held_back:
+        owner_heading = ' Manifest |' if multiple else ''
+        owner_separator = ' --- |' if multiple else ''
         body += ('\n\nVersions held back by compatibility constraints:\n\n'
-                 '| Package | Type | Resolved | Latest stable |\n| --- | --- | --- | --- |\n' + '\n'.join(held_back))
+                 f'|{owner_heading} Package | Type | Resolved | Latest stable |\n'
+                 f'|{owner_separator} --- | --- | --- | --- |\n' + '\n'.join(held_back))
     return {'dependencies': dependencies, 'files': list(workspace.files),
             'pr-title': 'chore(deps): update Flutter dependencies',
             'commit-message': 'chore(deps): update Flutter dependencies', 'pr-body': body}

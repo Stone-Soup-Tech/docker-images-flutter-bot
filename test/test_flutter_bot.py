@@ -71,6 +71,7 @@ class ResolutionTests(unittest.TestCase):
         self.assertNotIn('| [build_package](https://pub.dev/packages/build_package) |', update['pr-body'])
         self.assertNotIn('```diff', update['pr-body'])
         self.assertIn('| [example](https://pub.dev/packages/example) | dependencies | `2.0.0` | `3.0.0` |', update['pr-body'])
+        self.assertNotIn('| Manifest |', update['pr-body'])
         self.assertLess(update['pr-body'].index('Updated direct dependencies'),
                         update['pr-body'].index('Versions held back'))
         self.assertEqual(update['dependencies'][1]['version'], '1.0.0+2')

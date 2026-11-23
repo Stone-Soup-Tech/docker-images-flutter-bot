@@ -71,6 +71,16 @@ class WorkspaceTests(unittest.TestCase):
     def test_unchanged_workspace_has_no_update(self):
         self.assertIsNone(self.resolve(changed=False)[0])
 
+    def test_held_back_versions_list_each_declaring_manifest(self):
+        update, _ = self.resolve()
+        table = update['pr-body'].split('Versions held back by compatibility constraints:')[1]
+        self.assertIn('| Manifest | Package | Type | Resolved | Latest stable |', table)
+        for manifest, kind in (('packages/app/pubspec.yaml', 'dependencies'),
+                               ('packages/helper/pubspec.yaml', 'dev_dependencies')):
+            self.assertIn(f'| `{manifest}` | [shared](https://pub.dev/packages/shared) | '
+                          f'{kind} | `2.0.0` | `3.0.0` |', table)
+        self.assertEqual(table.count('[shared]'), 2)
+
     def test_member_prerelease_prevents_publication(self):
         with self.assertRaisesRegex(RuntimeError, 'contain prereleases: shared'):
             self.resolve(prerelease=True)
