@@ -58,7 +58,7 @@ Configure these as **secured Bitbucket repository or workspace variables**:
 
 | Variable | Purpose |
 | --- | --- |
-| `BOT_USERNAME` | Atlassian account email for Bitbucket REST authentication. |
+| `BOT_EMAIL` | Atlassian account email for Bitbucket REST authentication. |
 | `BOT_API_TOKEN` | Account API token for Git access and pull request publishing. |
 
 The account needs repository read/write, pull request read/write and user read
@@ -431,7 +431,7 @@ by adding `flutter --version` to the pipeline script.
 
 | Symptom | What to check |
 | --- | --- |
-| Authentication or permission errors | Use the account email for `BOT_USERNAME`; check token permissions, repository access and permission to push bot branches. |
+| Authentication or permission errors | Use the account email for `BOT_EMAIL`; check token permissions, repository access and permission to push bot branches. |
 | Resolution fails | Check the image's Flutter/Dart versions, application SDK constraints, package conflicts and private dependency authentication. |
 | A dependency stays below its latest release | Check dependency constraints and Flutter SDK pins. A newer version may need a newer SDK or changes to other dependencies. |
 | Stable-only policy error | Check whether a direct dependency or dev dependency requires a prerelease. |

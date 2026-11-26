@@ -13,7 +13,7 @@ from sdk import flutter_bot as bot
 class PublishingTests(unittest.TestCase):
     def make_client(self):
         with patch.dict("os.environ", {"BITBUCKET_REPO_FULL_NAME": "workspace/repository",
-                                      "BOT_USERNAME": "bot@example.com",
+                                      "BOT_EMAIL": "bot@example.com",
                                       "BOT_API_TOKEN": "secret-token"}):
             return bot.Bitbucket("dev")
 
@@ -165,7 +165,7 @@ class PublishingTests(unittest.TestCase):
 
     def test_pipeline_branch_is_detected_automatically(self):
         with patch.dict("os.environ", {"BITBUCKET_REPO_FULL_NAME": "workspace/repository",
-                                      "BOT_USERNAME": "bot@example.com", "BOT_API_TOKEN": "token",
+                                      "BOT_EMAIL": "bot@example.com", "BOT_API_TOKEN": "token",
                                       "BITBUCKET_BRANCH": "dev"}, clear=True), \
                 patch.object(bot.Bitbucket, "request") as request:
             client = bot.Bitbucket()
@@ -174,14 +174,14 @@ class PublishingTests(unittest.TestCase):
 
     def test_default_branch_is_used_outside_pipelines(self):
         with patch.dict("os.environ", {"BITBUCKET_REPO_FULL_NAME": "workspace/repository",
-                                      "BOT_USERNAME": "bot@example.com", "BOT_API_TOKEN": "token"}, clear=True), \
+                                      "BOT_EMAIL": "bot@example.com", "BOT_API_TOKEN": "token"}, clear=True), \
                 patch.object(bot.Bitbucket, "request", return_value={"mainbranch": {"name": "main"}}):
             client = bot.Bitbucket()
         self.assertEqual(client.base_branch, "main")
 
     def test_own_update_branch_is_rejected(self):
         with patch.dict("os.environ", {"BITBUCKET_REPO_FULL_NAME": "workspace/repository",
-                                      "BOT_USERNAME": "bot@example.com", "BOT_API_TOKEN": "token",
+                                      "BOT_EMAIL": "bot@example.com", "BOT_API_TOKEN": "token",
                                       "BITBUCKET_BRANCH": "flutter-bot/dependencies-dev"}, clear=True):
             with self.assertRaisesRegex(ValueError, "own update branch"):
                 bot.Bitbucket()

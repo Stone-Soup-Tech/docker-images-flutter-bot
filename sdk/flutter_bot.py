@@ -107,7 +107,7 @@ class Bitbucket(Provider):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository):
             raise ValueError("Invalid BITBUCKET_REPO_FULL_NAME")
 
-        self.username = os.environ["BOT_USERNAME"]
+        self.username = os.environ["BOT_EMAIL"]
         self.token = os.environ["BOT_API_TOKEN"]
         self.authorization = "Basic " + base64.b64encode(
             f"{self.username}:{self.token}".encode()

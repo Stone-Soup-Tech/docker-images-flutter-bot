@@ -36,7 +36,7 @@ class CheckoutTests(unittest.TestCase):
         self.run_git(self.checkout, 'checkout', '--quiet', '--detach', self.base)
         self.run_git(self.checkout, 'config', 'commit.gpgSign', 'false')
         with patch.dict(os.environ, {'BITBUCKET_REPO_FULL_NAME': 'workspace/repository',
-                                     'BOT_USERNAME': 'bot', 'BOT_API_TOKEN': 'secret'}):
+                                     'BOT_EMAIL': 'bot', 'BOT_API_TOKEN': 'secret'}):
             self.client = bot.Bitbucket('dev')
         self.client.branch = Mock()
         self.client.pull_requests = Mock()
